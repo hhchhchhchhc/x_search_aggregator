@@ -1,10 +1,11 @@
 # x_search_aggregator
 
-关键词抓取与分析工具：从 X（Twitter）采集内容，生成结构化数据与深度汇总 HTML 文章。
+关键词抓取与分析工具：从 X（Twitter）采集内容，支持可自定义滚动翻页与抓取条数控制，并生成结构化数据与深度汇总 HTML 文章。
 
 ## 功能概览
 
 - 关键词抓取（Latest / Top）
+- 可自定义滚动翻页爬取，爬多少由你控制（如 `--max-items`、`--max-scrolls`）
 - API 模式与浏览器模式双支持
 - 导出 `results.json` / `results.csv`
 - 导出 `summary.json` / `summary.md`
