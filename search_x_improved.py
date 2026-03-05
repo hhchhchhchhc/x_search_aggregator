@@ -1,0 +1,662 @@
+#!/usr/bin/env python3
+"""Improved Search x.com by keyword, collect results, and generate summary outputs."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import re
+import time
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Dict, List, Optional, Set
+from urllib.parse import quote
+
+from playwright.sync_api import BrowserContext, Page, sync_playwright, TimeoutError
+
+# Enhanced regex patterns
+COUNT_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)([KMB]?)", re.IGNORECASE)
+ZH_COUNT_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)([万亿])")
+HASHTAG_RE = re.compile(r"#([A-Za-z0-9_\u4e00-\u9fff]+)")
+MENTION_RE = re.compile(r"@([A-Za-z0-9_]+)")
+STATUS_PATH_RE = re.compile(r"(?:https?://x\.com)?/(?:i/web/)?([^/]+)/status/(\d+)")
+
+# Multiple selector strategies for tweets
+TWEET_SELECTORS = [
+    'article[data-testid="tweet"]',
+    'div[data-testid="cellInnerDiv"] article[data-testid="tweet"]',
+    'main article[data-testid="tweet"]',
+]
+
+FEED_SELECTORS = [
+    'section[role="region"] div[aria-label][tabindex="0"]',
+    'div[role="main"]',
+    "main",
+]
+
+END_MARKER_SELECTORS = [
+    'span:has-text("No more results")',
+    'span:has-text("Try searching for something else")',
+    'span:has-text("没有更多结果")',
+    'span:has-text("换个关键词试试")',
+]
+
+# Text content selectors with fallbacks
+TEXT_SELECTORS = [
+    'div[data-testid="tweetText"]',
+    'div[lang] div:not([data-testid]):not([role])',
+    'div[dir="auto"][lang]',
+    'span[lang]',
+]
+
+# User info selectors
+USER_SELECTORS = [
+    'div[data-testid="User-Name"]',
+    'a[href^="/"][role="link"]',
+    'div[aria-label*="@"], span[aria-label*="@"]',
+]
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Search x.com and aggregate results.")
+    parser.add_argument("--keyword", required=True, help="Search keyword")
+    parser.add_argument("--max-items", type=int, default=200, help="Max tweets to collect")
+    parser.add_argument("--max-scrolls", type=int, default=120, help="Max scroll rounds (increased)")
+    parser.add_argument("--no-new-stop", type=int, default=8, help="Stop after N rounds with no new tweets (increased)")
+    parser.add_argument("--sort", choices=["Top", "Latest"], default="Latest", help="Search tab")
+    parser.add_argument("--lang", default="", help="Optional language code, e.g. en/zh")
+    parser.add_argument("--state", default="auth_state.json", help="Playwright storage state path")
+    parser.add_argument("--headless", action="store_true", help="Run browser in headless mode")
+    parser.add_argument("--out-dir", default="output", help="Output base directory")
+    parser.add_argument("--scroll-pause", type=int, default=2000, help="Pause between scrolls in ms")
+    parser.add_argument("--retry-attempts", type=int, default=3, help="Retry attempts for failed operations")
+    return parser.parse_args()
+
+
+def parse_count(raw: str) -> int:
+    if not raw:
+        return 0
+    raw = str(raw).strip().replace(",", "").replace(" ", "")
+    if not raw:
+        return 0
+    zh_m = ZH_COUNT_RE.search(raw)
+    if zh_m:
+        value = float(zh_m.group(1))
+        unit = zh_m.group(2)
+        multiplier = {"万": 10_000, "亿": 100_000_000}.get(unit, 1)
+        return int(value * multiplier)
+
+    m = COUNT_RE.search(raw)
+    if not m:
+        # Try to extract just numbers
+        nums = re.findall(r'\d+', raw.replace(',', ''))
+        if nums:
+            return int(nums[0])
+        return 0
+
+    value = float(m.group(1))
+    suffix = m.group(2).upper()
+    multiplier = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}.get(suffix, 1)
+    return int(value * multiplier)
+
+
+def safe_name(text: str) -> str:
+    text = re.sub(r"\s+", "_", str(text).strip())
+    text = re.sub(r"[^A-Za-z0-9_\-\u4e00-\u9fff]", "", text)
+    return text[:60] or "keyword"
+
+
+def make_search_url(keyword: str, tab: str, lang: str) -> str:
+    normalized_keyword = re.sub(r"\s+", " ", keyword).strip()
+    q = normalized_keyword
+    if lang:
+        q = f"{normalized_keyword} lang:{lang}"
+    f = "live" if tab == "Latest" else "top"
+    # Ensure proper encoding for Chinese characters
+    encoded_q = quote(q, safe=":")
+    return f"https://x.com/search?q={encoded_q}&src=typed_query&f={f}"
+
+
+def parse_status_href(href: str) -> tuple[Optional[str], Optional[str]]:
+    if not href:
+        return None, None
+    match = STATUS_PATH_RE.search(href)
+    if not match:
+        return None, None
+    return match.group(1), match.group(2)
+
+
+def extract_metric(article, testid: str) -> int:
+    """Extract metrics with multiple fallback strategies"""
+    # Primary method: data-testid buttons
+    btn = article.query_selector(f'button[data-testid="{testid}"]')
+    if btn:
+        text = (btn.inner_text() or "").strip()
+        if text:
+            return parse_count(text)
+    
+    # Fallback: look for any button with the metric name
+    fallback_selectors = [
+        f'button[aria-label*="{testid}"]',
+        f'div[aria-label*="{testid}"]',
+        f'span[data-testid*="{testid}"]',
+    ]
+    
+    for selector in fallback_selectors:
+        element = article.query_selector(selector)
+        if element:
+            text = (element.inner_text() or "").strip()
+            if text:
+                return parse_count(text)
+    
+    return 0
+
+
+def extract_views(article) -> int:
+    """Extract view count with enhanced fallbacks"""
+    # Primary: analytics button
+    btn = article.query_selector('button[data-testid="analytics"]')
+    if btn:
+        text = (btn.inner_text() or "").strip()
+        if text:
+            return parse_count(text)
+    
+    # Fallback: look for view indicators
+    view_selectors = [
+        'span:has-text("view")',
+        'div:has-text("view")',
+        '[aria-label*="view"]',
+    ]
+    
+    for selector in view_selectors:
+        elements = article.query_selector_all(selector)
+        for el in elements:
+            text = (el.inner_text() or "").strip()
+            if text and ('view' in text.lower() or '浏览' in text):
+                return parse_count(text)
+    
+    return 0
+
+
+def extract_text_content(article) -> str:
+    """Extract tweet text with multiple fallback strategies"""
+    for selector in TEXT_SELECTORS:
+        elements = article.query_selector_all(selector)
+        for el in elements:
+            text = (el.inner_text() or "").strip()
+            if text and len(text) > 0:
+                return text
+    
+    # Last resort: get all text from the article
+    all_text = (article.inner_text() or "").strip()
+    if all_text:
+        # Try to find the main content by splitting and taking reasonable chunks
+        lines = [line.strip() for line in all_text.split('\n') if line.strip()]
+        if lines:
+            # Return the longest line that seems like content (not metadata)
+            content_lines = [line for line in lines if len(line) > 10 and not line.startswith(('Reply', 'Retweet', 'Like', 'Bookmark'))]
+            if content_lines:
+                return max(content_lines, key=len)
+    
+    return ""
+
+
+def extract_user_info(article) -> tuple[str, str]:
+    """Extract user name and handle with fallbacks"""
+    user_name = ""
+    user_handle = ""
+    
+    # Try primary user block selector
+    for selector in USER_SELECTORS:
+        user_blocks = article.query_selector_all(selector)
+        for block in user_blocks:
+            # Extract user name
+            name_spans = block.query_selector_all('span')
+            for span in name_spans:
+                span_text = (span.inner_text() or "").strip()
+                if span_text and not span_text.startswith('@') and len(span_text) > 1:
+                    user_name = span_text
+                    break
+            
+            # Extract user handle
+            handle_links = block.query_selector_all('a[href^="/"]')
+            for link in handle_links:
+                href = (link.get_attribute("href") or "").strip()
+                if href and href.count('/') == 1 and not href.endswith('/'):
+                    user_handle = href.strip('/')
+                    break
+            
+            if user_name or user_handle:
+                break
+        
+        if user_name or user_handle:
+            break
+    
+    # Fallback: extract from URL if available
+    if not user_handle:
+        links = article.query_selector_all('a[href*="/status/"]')
+        for a in links:
+            href = (a.get_attribute("href") or "").strip()
+            handle, _ = parse_status_href(href)
+            if handle:
+                user_handle = handle
+                break
+
+    return user_name, user_handle
+
+
+def extract_tweet(article) -> Optional[Dict]:
+    """Enhanced tweet extraction with robust fallbacks"""
+    # Extract tweet URL and ID
+    links = article.query_selector_all('a[href*="/status/"]')
+    tweet_url = None
+    tweet_id = None
+    
+    link_user_handle = ""
+    for a in links:
+        href = (a.get_attribute("href") or "").strip()
+        handle, status_id = parse_status_href(href)
+        if status_id:
+            tweet_url = href if href.startswith("http") else f"https://x.com{href.split('?')[0]}"
+            tweet_id = status_id
+            link_user_handle = handle or ""
+            break
+
+    if not tweet_id:
+        return None
+
+    # Extract text content
+    text = extract_text_content(article)
+
+    # Extract timestamp
+    posted_at = None
+    time_el = article.query_selector("time")
+    if time_el:
+        posted_at = time_el.get_attribute("datetime")
+    else:
+        # Fallback: look for aria-label with timestamp
+        time_aria = article.query_selector('[aria-label*="年"]')  # Chinese date format
+        if not time_aria:
+            time_aria = article.query_selector('[aria-label*=":"], [aria-label*="AM"], [aria-label*="PM"]')
+        if time_aria:
+            aria_label = time_aria.get_attribute("aria-label") or ""
+            # Extract potential timestamp from aria-label
+            if ":" in aria_label:
+                posted_at = aria_label
+
+    # Extract user info
+    user_name, user_handle = extract_user_info(article)
+    if not user_handle:
+        user_handle = link_user_handle
+
+    return {
+        "tweet_id": tweet_id,
+        "url": tweet_url,
+        "user_name": user_name,
+        "user_handle": user_handle,
+        "posted_at": posted_at,
+        "text": text,
+        "reply_count": extract_metric(article, "reply"),
+        "retweet_count": extract_metric(article, "retweet"),
+        "like_count": extract_metric(article, "like"),
+        "bookmark_count": extract_metric(article, "bookmark"),
+        "view_count": extract_views(article),
+    }
+
+
+def wait_for_search_results(page: Page, timeout: int = 10000) -> bool:
+    """Wait for search results to load with multiple validation strategies"""
+    try:
+        # Wait for any of the tweet selectors to appear
+        for selector in TWEET_SELECTORS:
+            try:
+                page.wait_for_selector(selector, timeout=timeout//len(TWEET_SELECTORS))
+                return True
+            except TimeoutError:
+                continue
+        
+        # Fallback: wait for general content
+        page.wait_for_selector('main, section, div[role="feed"]', timeout=timeout)
+        return True
+    except TimeoutError:
+        print("Warning: Could not detect search results loading")
+        return False
+
+
+def get_cards(page: Page):
+    cards = []
+    for selector in TWEET_SELECTORS:
+        found = page.query_selector_all(selector)
+        if found:
+            cards.extend(found)
+    return cards
+
+
+def has_end_marker(page: Page) -> bool:
+    for selector in END_MARKER_SELECTORS:
+        if page.query_selector(selector):
+            return True
+    return False
+
+
+def get_last_visible_anchor(page: Page) -> str:
+    cards = get_cards(page)
+    for card in reversed(cards):
+        link = card.query_selector('a[href*="/status/"]')
+        if not link:
+            continue
+        href = (link.get_attribute("href") or "").strip()
+        handle, status_id = parse_status_href(href)
+        if handle and status_id:
+            return f"{handle}/{status_id}"
+    return ""
+
+
+def scroll_feed(page: Page, round_idx: int) -> None:
+    page.evaluate(
+        """(selectors) => {
+            for (const selector of selectors) {
+                const el = document.querySelector(selector);
+                if (el && typeof el.scrollBy === "function") {
+                    el.scrollBy(0, Math.floor(window.innerHeight * 1.4));
+                    break;
+                }
+            }
+        }""",
+        FEED_SELECTORS,
+    )
+    page.mouse.wheel(0, 3200)
+    page.evaluate("window.scrollBy(0, Math.floor(window.innerHeight * 1.4))")
+    if round_idx % 3 == 0:
+        page.keyboard.press("End")
+
+
+def collect_tweets(page: Page, max_items: int, max_scrolls: int, no_new_stop: int, scroll_pause: int) -> List[Dict]:
+    """Enhanced tweet collection with better scrolling and detection"""
+    seen: Dict[str, Dict] = {}
+    seen_ids: Set[str] = set()
+    no_new_rounds = 0
+    anchor_stall_rounds = 0
+    last_anchor = ""
+    
+    # Initial wait for page to load
+    time.sleep(2)
+    
+    for idx in range(max_scrolls):
+        cards = get_cards(page)
+        new_count = 0
+        print(f"Scroll {idx + 1}/{max_scrolls}: cards in viewport={len(cards)}")
+
+        for card in cards:
+            try:
+                item = extract_tweet(card)
+                if not item:
+                    continue
+                if item["tweet_id"] in seen_ids:
+                    continue
+                
+                seen[item["tweet_id"]] = item
+                seen_ids.add(item["tweet_id"])
+                new_count += 1
+                
+                if len(seen) >= max_items:
+                    print(f"Reached max items: {max_items}")
+                    return list(seen.values())
+            except Exception as e:
+                print(f"Error extracting tweet: {e}")
+                continue
+
+        print(f"Scroll {idx + 1}/{max_scrolls}: +{new_count} new, total {len(seen)}")
+
+        # Check if we should stop due to no new content
+        if new_count == 0:
+            no_new_rounds += 1
+        else:
+            no_new_rounds = 0
+
+        current_anchor = get_last_visible_anchor(page)
+        if current_anchor and current_anchor == last_anchor:
+            anchor_stall_rounds += 1
+        else:
+            anchor_stall_rounds = 0
+        last_anchor = current_anchor or last_anchor
+
+        if has_end_marker(page) and new_count == 0:
+            print("Detected end-of-results marker. Stop scrolling.")
+            break
+
+        if no_new_rounds >= no_new_stop and anchor_stall_rounds >= 3:
+            print(
+                f"No new tweets for {no_new_rounds} rounds and anchor stalled for {anchor_stall_rounds} rounds. Stop scrolling."
+            )
+            break
+
+        scroll_feed(page, idx)
+        pause_ms = scroll_pause if new_count > 0 else int(scroll_pause * 1.35)
+        page.wait_for_timeout(pause_ms)
+
+    return list(seen.values())
+
+
+def to_dt(ts: Optional[str]) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        # Handle various timestamp formats
+        clean_ts = str(ts).strip()
+        if clean_ts.endswith('Z'):
+            return datetime.fromisoformat(clean_ts.replace("Z", "+00:00"))
+        elif '+' in clean_ts or clean_ts.count('-') >= 2:
+            return datetime.fromisoformat(clean_ts)
+        else:
+            # Try to parse other formats
+            from dateutil import parser
+            return parser.parse(clean_ts)
+    except (ValueError, ImportError):
+        return None
+
+
+def summarize(items: List[Dict], keyword: str) -> Dict:
+    hashtags = Counter()
+    mentions = Counter()
+
+    for it in items:
+        txt = it.get("text") or ""
+        hashtags.update([h.lower() for h in HASHTAG_RE.findall(txt)])
+        mentions.update([m.lower() for m in MENTION_RE.findall(txt)])
+
+    times = [to_dt(i.get("posted_at")) for i in items]
+    times = [t for t in times if t is not None]
+    times.sort()
+
+    top_liked = sorted(items, key=lambda x: x.get("like_count", 0), reverse=True)[:10]
+
+    return {
+        "keyword": keyword,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "total_collected": len(items),
+        "time_range": {
+            "from": times[0].isoformat() if times else None,
+            "to": times[-1].isoformat() if times else None,
+        },
+        "top_hashtags": hashtags.most_common(20),
+        "top_mentions": mentions.most_common(20),
+        "top_liked": [
+            {
+                "tweet_id": i["tweet_id"],
+                "url": i["url"],
+                "user_handle": i.get("user_handle", ""),
+                "like_count": i.get("like_count", 0),
+                "retweet_count": i.get("retweet_count", 0),
+                "reply_count": i.get("reply_count", 0),
+                "text": (i.get("text") or "")[:240],
+            }
+            for i in top_liked
+        ],
+    }
+
+
+def write_csv(path: Path, items: List[Dict]) -> None:
+    fields = [
+        "tweet_id",
+        "url",
+        "user_name",
+        "user_handle",
+        "posted_at",
+        "text",
+        "reply_count",
+        "retweet_count",
+        "like_count",
+        "bookmark_count",
+        "view_count",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(items)
+
+
+def write_summary_md(path: Path, summary: Dict) -> None:
+    lines = [
+        f"# X Search Summary: {summary['keyword']}",
+        "",
+        f"- Generated at (UTC): {summary['generated_at']}",
+        f"- Total collected: {summary['total_collected']}",
+        f"- Time range: {summary['time_range']['from']} ~ {summary['time_range']['to']}",
+        "",
+        "## Top hashtags",
+    ]
+    for tag, cnt in summary["top_hashtags"]:
+        lines.append(f"- #{tag}: {cnt}")
+
+    lines.append("")
+    lines.append("## Top mentions")
+    for u, cnt in summary["top_mentions"]:
+        lines.append(f"- @{u}: {cnt}")
+
+    lines.append("")
+    lines.append("## Top liked tweets")
+    for i, row in enumerate(summary["top_liked"], start=1):
+        lines.append(f"{i}. @{row['user_handle']} | likes={row['like_count']} | {row['url']}")
+
+    path.write_text("\n".join(lines), encoding="utf-8")
+
+
+def create_context(playwright, state: str, headless: bool) -> BrowserContext:
+    browser = playwright.chromium.launch(headless=headless)
+    state_path = Path(state)
+
+    if state_path.exists():
+        return browser.new_context(storage_state=str(state_path))
+
+    print(
+        f"[Warn] storage state not found: {state_path}. Continuing without login state."
+    )
+    return browser.new_context()
+
+
+def validate_auth_state(page: Page) -> bool:
+    """Validate that we're properly logged in"""
+    try:
+        # Check if we see the main feed or search page
+        page.wait_for_selector('nav[aria-label="Primary"], input[data-testid="SearchBox_Search_Input"]', timeout=5000)
+        return True
+    except TimeoutError:
+        # Check if we're on login page
+        if page.url.startswith('https://x.com/i/flow/login') or 'login' in page.url.lower():
+            print("Warning: Not logged in - you may need to run login_x.py first")
+            return False
+        return True
+
+
+def fallback_search_via_input(page: Page, keyword: str, tab: str, lang: str) -> None:
+    query = keyword.strip()
+    if lang:
+        query = f"{query} lang:{lang}"
+    selectors = [
+        'input[data-testid="SearchBox_Search_Input"]',
+        'input[aria-label*="Search"]',
+        'input[aria-label*="搜索"]',
+    ]
+    for selector in selectors:
+        inp = page.query_selector(selector)
+        if not inp:
+            continue
+        inp.click()
+        inp.fill("")
+        inp.type(query, delay=50)
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(1500)
+        if tab == "Latest":
+            latest_tab = page.query_selector('a[href*="f=live"], span:has-text("Latest"), span:has-text("最新")')
+            if latest_tab:
+                latest_tab.click()
+                page.wait_for_timeout(1200)
+        return
+
+
+def main() -> None:
+    args = parse_args()
+
+    out_base = Path(args.out_dir).expanduser().resolve()
+    run_dir = out_base / f"{safe_name(args.keyword)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    search_url = make_search_url(args.keyword, args.sort, args.lang)
+    print(f"Search URL: {search_url}")
+
+    with sync_playwright() as p:
+        context = create_context(p, args.state, args.headless)
+        page = context.new_page()
+        
+        # Navigate to search URL
+        page.goto(search_url, wait_until="domcontentloaded")
+        page.wait_for_timeout(3000)
+        
+        # Validate authentication state
+        if not validate_auth_state(page):
+            print("Authentication issue detected. Results may be limited.")
+        
+        # Wait for search results
+        if not wait_for_search_results(page):
+            print("Warning: Search results may not have loaded properly, trying input fallback...")
+            fallback_search_via_input(page, args.keyword, args.sort, args.lang)
+            wait_for_search_results(page, timeout=15000)
+        
+        items = collect_tweets(
+            page=page,
+            max_items=args.max_items,
+            max_scrolls=args.max_scrolls,
+            no_new_stop=args.no_new_stop,
+            scroll_pause=args.scroll_pause,
+        )
+        context.close()
+
+    if not items:
+        print("Warning: No tweets were collected. Check your authentication and network connection.")
+        return
+
+    summary = summarize(items, args.keyword)
+
+    json_path = run_dir / "results.json"
+    csv_path = run_dir / "results.csv"
+    summary_json = run_dir / "summary.json"
+    summary_md = run_dir / "summary.md"
+
+    json_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_csv(csv_path, items)
+    summary_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_summary_md(summary_md, summary)
+
+    print("=" * 60)
+    print(f"Done. Collected {len(items)} tweets.")
+    print(f"Results JSON:   {json_path}")
+    print(f"Results CSV:    {csv_path}")
+    print(f"Summary JSON:   {summary_json}")
+    print(f"Summary Markdown: {summary_md}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
