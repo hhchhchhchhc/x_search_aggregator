@@ -16,6 +16,7 @@
 - `search_x_api.py`：官方 API 抓取（推荐，稳定）
 - `search_x.py`：Playwright + 登录态文件抓取
 - `search_with_existing_chrome.py`：连接已有 Chrome（CDP）抓取
+- `crawl_user_timeline.py`：按用户主页滚动抓取历史推文并生成详细分析报告
 - `login_x.py`：登录并保存会话状态
 - `html_report.py`：深度分析与 HTML 文章生成
 
@@ -59,6 +60,21 @@ python login_x.py --state auth_state.json --timeout 180
 python search_x.py --keyword "信息差" --max-items 300 --sort Latest --state auth_state.json --lang zh --max-scrolls 180 --no-new-stop 10
 ```
 
+### 方案 C：抓取某用户历史推文（示例：`@vista8`）
+
+```bash
+python crawl_user_timeline.py \
+  --user-url "https://x.com/vista8" \
+  --state auth_state.json \
+  --max-items 300 \
+  --max-scrolls 500 \
+  --no-new-stop 25
+```
+
+说明：
+- `--max-items 0` 表示不设硬上限，滚动到页面无新增为止（受平台加载策略影响，不保证绝对全量）。
+- 可加 `--with-replies` 抓取 `with_replies` 时间线。
+
 ## 输出结果
 
 每次运行生成目录：
@@ -71,6 +87,15 @@ output/<关键词>_<时间戳>/
   ├── summary.md
   ├── article.html
   └── article_analysis.json
+
+用户历史抓取还会额外生成：
+
+```text
+output/user_<handle>_<时间戳>/
+  ├── detailed_report.json
+  ├── detailed_report.md
+  └── detailed_report.html
+```
 ```
 
 ## 常见问题

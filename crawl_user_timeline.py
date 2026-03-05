@@ -1,0 +1,439 @@
+#!/usr/bin/env python3
+"""Crawl a user's timeline on X and generate detailed analysis reports."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import json
+import re
+from collections import Counter
+from datetime import datetime, timezone
+from pathlib import Path
+from statistics import median
+from typing import Dict, List, Optional
+from urllib.parse import urlparse
+
+from playwright.sync_api import sync_playwright
+
+from html_report import write_html_article
+from search_x import (
+    HASHTAG_RE,
+    MENTION_RE,
+    create_context,
+    extract_tweet,
+    get_cards,
+    get_last_visible_anchor,
+    has_end_marker,
+    parse_count,
+    scroll_feed,
+    summarize,
+    validate_auth_state,
+    write_summary_md,
+)
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Crawl user's historical tweets from X timeline")
+    p.add_argument("--user-url", required=True, help="User profile URL, e.g. https://x.com/vista8")
+    p.add_argument("--state", default="auth_state.json", help="Playwright storage state path")
+    p.add_argument("--headless", action="store_true", help="Run browser in headless mode")
+    p.add_argument("--out-dir", default="output", help="Output base directory")
+    p.add_argument(
+        "--max-items",
+        type=int,
+        default=0,
+        help="Max tweets to collect (0 means no hard limit, crawl until feed stalls)",
+    )
+    p.add_argument("--max-scrolls", type=int, default=1000, help="Max scroll rounds")
+    p.add_argument("--no-new-stop", type=int, default=25, help="Stop after N rounds with no new items")
+    p.add_argument("--scroll-pause", type=int, default=1500, help="Pause between scrolls in ms")
+    p.add_argument("--with-replies", action="store_true", help="Crawl /with_replies timeline")
+    return p.parse_args()
+
+
+def safe_name(text: str) -> str:
+    text = re.sub(r"\s+", "_", str(text).strip())
+    text = re.sub(r"[^A-Za-z0-9_\-\u4e00-\u9fff]", "", text)
+    return text[:80] or "user"
+
+
+def parse_user_handle(user_url: str) -> str:
+    u = user_url.strip()
+    if u.startswith("@"):
+        return u[1:]
+    if u.startswith("http://") or u.startswith("https://"):
+        path = urlparse(u).path.strip("/")
+        if not path:
+            raise ValueError(f"Invalid --user-url: {user_url}")
+        return path.split("/")[0].lstrip("@")
+    return u.strip("/").lstrip("@")
+
+
+def parse_views(article) -> int:
+    btn = article.query_selector('button[data-testid="analytics"]')
+    if not btn:
+        return 0
+    text = (btn.inner_text() or "").strip()
+    return parse_count(text)
+
+
+def normalize_item(item: Dict, card) -> Dict:
+    item = dict(item)
+    item["view_count"] = parse_views(card)
+    return item
+
+
+def collect_user_tweets(
+    page,
+    max_items: int,
+    max_scrolls: int,
+    no_new_stop: int,
+    scroll_pause: int,
+) -> List[Dict]:
+    seen: Dict[str, Dict] = {}
+    no_new_rounds = 0
+    anchor_stall_rounds = 0
+    last_anchor = ""
+
+    for idx in range(max_scrolls):
+        cards = get_cards(page)
+        new_count = 0
+
+        for card in cards:
+            item = extract_tweet(card)
+            if not item:
+                continue
+            tid = item["tweet_id"]
+            if tid in seen:
+                continue
+
+            seen[tid] = normalize_item(item, card)
+            new_count += 1
+
+            if max_items > 0 and len(seen) >= max_items:
+                print(f"Reached max items: {max_items}")
+                return list(seen.values())
+
+        print(f"Scroll {idx + 1}/{max_scrolls}: +{new_count} new, total {len(seen)}")
+
+        if new_count == 0:
+            no_new_rounds += 1
+        else:
+            no_new_rounds = 0
+
+        current_anchor = get_last_visible_anchor(page)
+        if current_anchor and current_anchor == last_anchor:
+            anchor_stall_rounds += 1
+        elif not current_anchor and new_count == 0:
+            anchor_stall_rounds += 1
+        else:
+            anchor_stall_rounds = 0
+        last_anchor = current_anchor or last_anchor
+
+        if has_end_marker(page) and new_count == 0:
+            print("Detected end marker on timeline. Stop scrolling.")
+            break
+
+        if no_new_rounds >= no_new_stop and anchor_stall_rounds >= 3:
+            print(
+                f"No new tweets for {no_new_rounds} rounds and anchor stalled for {anchor_stall_rounds} rounds. Stop scrolling."
+            )
+            break
+
+        scroll_feed(page, idx)
+        pause_ms = scroll_pause if new_count > 0 else int(scroll_pause * 1.35)
+        page.wait_for_timeout(pause_ms)
+
+    return list(seen.values())
+
+
+def to_dt(ts: Optional[str]) -> Optional[datetime]:
+    if not ts:
+        return None
+    try:
+        if ts.endswith("Z"):
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        return datetime.fromisoformat(ts)
+    except Exception:
+        return None
+
+
+def build_detailed_analysis(items: List[Dict], user_handle: str) -> Dict:
+    likes = [int(i.get("like_count", 0)) for i in items]
+    rts = [int(i.get("retweet_count", 0)) for i in items]
+    replies = [int(i.get("reply_count", 0)) for i in items]
+    views = [int(i.get("view_count", 0)) for i in items if int(i.get("view_count", 0)) > 0]
+
+    total = len(items)
+    times = [to_dt(i.get("posted_at")) for i in items]
+    times = [t for t in times if t is not None]
+    times.sort()
+
+    by_month = Counter()
+    by_weekday = Counter()
+    by_hour = Counter()
+    if times:
+        for t in times:
+            by_month[t.strftime("%Y-%m")] += 1
+            by_weekday[t.strftime("%A")] += 1
+            by_hour[t.strftime("%H")] += 1
+
+    tags = Counter()
+    mentions = Counter()
+    for i in items:
+        txt = i.get("text") or ""
+        tags.update([x.lower() for x in HASHTAG_RE.findall(txt)])
+        mentions.update([x.lower() for x in MENTION_RE.findall(txt)])
+
+    top_eng = sorted(
+        items,
+        key=lambda x: int(x.get("like_count", 0)) + int(x.get("retweet_count", 0)) * 2 + int(x.get("reply_count", 0)),
+        reverse=True,
+    )[:20]
+
+    span_days = 0
+    if len(times) >= 2:
+        span_days = max(1, (times[-1] - times[0]).days + 1)
+
+    analysis = {
+        "user_handle": user_handle,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "total_collected": total,
+        "time_range": {
+            "from": times[0].isoformat() if times else None,
+            "to": times[-1].isoformat() if times else None,
+            "days": span_days,
+        },
+        "activity": {
+            "avg_tweets_per_day": round(total / span_days, 3) if span_days else None,
+            "by_month": [{"month": k, "count": v} for k, v in by_month.most_common()],
+            "by_weekday": [{"weekday": k, "count": v} for k, v in by_weekday.most_common()],
+            "by_hour": [{"hour": k, "count": v} for k, v in by_hour.most_common()],
+        },
+        "engagement": {
+            "avg_like": round(sum(likes) / total, 3) if total else 0,
+            "median_like": median(likes) if likes else 0,
+            "avg_retweet": round(sum(rts) / total, 3) if total else 0,
+            "avg_reply": round(sum(replies) / total, 3) if total else 0,
+            "avg_view": round(sum(views) / len(views), 3) if views else None,
+        },
+        "top_hashtags": [{"tag": k, "count": v} for k, v in tags.most_common(30)],
+        "top_mentions": [{"username": k, "count": v} for k, v in mentions.most_common(30)],
+        "top_engagement_tweets": [
+            {
+                "tweet_id": x.get("tweet_id"),
+                "url": x.get("url"),
+                "posted_at": x.get("posted_at"),
+                "like_count": x.get("like_count", 0),
+                "retweet_count": x.get("retweet_count", 0),
+                "reply_count": x.get("reply_count", 0),
+                "view_count": x.get("view_count", 0),
+                "text": (x.get("text") or "")[:260],
+            }
+            for x in top_eng
+        ],
+    }
+    return analysis
+
+
+def write_csv(path: Path, items: List[Dict]) -> None:
+    fields = [
+        "tweet_id",
+        "url",
+        "user_name",
+        "user_handle",
+        "posted_at",
+        "text",
+        "reply_count",
+        "retweet_count",
+        "like_count",
+        "bookmark_count",
+        "view_count",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(items)
+
+
+def write_detailed_md(path: Path, analysis: Dict) -> None:
+    lines = [
+        f"# User Timeline Detailed Report: @{analysis['user_handle']}",
+        "",
+        f"- Generated at (UTC): {analysis['generated_at_utc']}",
+        f"- Total collected: {analysis['total_collected']}",
+        f"- Time range: {analysis['time_range']['from']} ~ {analysis['time_range']['to']}",
+        "",
+        "## Activity",
+        f"- Avg tweets/day: {analysis['activity']['avg_tweets_per_day']}",
+        "",
+        "## Engagement",
+        f"- Avg like: {analysis['engagement']['avg_like']}",
+        f"- Median like: {analysis['engagement']['median_like']}",
+        f"- Avg retweet: {analysis['engagement']['avg_retweet']}",
+        f"- Avg reply: {analysis['engagement']['avg_reply']}",
+        "",
+        "## Top hashtags",
+    ]
+
+    for x in analysis["top_hashtags"][:15]:
+        lines.append(f"- #{x['tag']}: {x['count']}")
+
+    lines.append("")
+    lines.append("## Top mentions")
+    for x in analysis["top_mentions"][:15]:
+        lines.append(f"- @{x['username']}: {x['count']}")
+
+    lines.append("")
+    lines.append("## Top engagement tweets")
+    for i, x in enumerate(analysis["top_engagement_tweets"][:15], start=1):
+        lines.append(
+            f"{i}. likes={x['like_count']} rt={x['retweet_count']} reply={x['reply_count']} | {x['url']}"
+        )
+
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def write_detailed_html(path: Path, analysis: Dict) -> None:
+    cards = "".join(
+        [
+            f"<li><strong>{x['month']}</strong>: {x['count']}</li>"
+            for x in analysis["activity"]["by_month"][:24]
+        ]
+    )
+    top_rows = "".join(
+        [
+            (
+                "<tr>"
+                f"<td>{i}</td>"
+                f"<td>{x['like_count']}</td>"
+                f"<td>{x['retweet_count']}</td>"
+                f"<td>{x['reply_count']}</td>"
+                f"<td>{(x.get('text') or '').replace('<', '&lt;').replace('>', '&gt;')[:120]}</td>"
+                f"<td><a href=\"{x['url']}\" target=\"_blank\">link</a></td>"
+                "</tr>"
+            )
+            for i, x in enumerate(analysis["top_engagement_tweets"][:20], start=1)
+        ]
+    )
+
+    html = f"""<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\" />
+  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
+  <title>@{analysis['user_handle']} Detailed Timeline Report</title>
+  <style>
+    body {{ font-family: "IBM Plex Sans", "Noto Sans", sans-serif; margin: 0; background:#f7f6f3; color:#1d1d1d; }}
+    .wrap {{ max-width: 1040px; margin: 0 auto; padding: 24px; }}
+    .card {{ background:#fff; border:1px solid #ddd5c8; border-radius:12px; padding:16px; margin-bottom:14px; }}
+    h1,h2 {{ margin: 0 0 10px; }}
+    ul {{ margin:0; padding-left:18px; }}
+    table {{ width:100%; border-collapse: collapse; font-size:14px; }}
+    th,td {{ border-bottom:1px solid #ece7df; padding:8px; text-align:left; }}
+    th {{ background:#f3efe8; }}
+  </style>
+</head>
+<body>
+  <main class=\"wrap\">
+    <section class=\"card\">
+      <h1>@{analysis['user_handle']} 历史推文详细分析</h1>
+      <p>Generated at (UTC): {analysis['generated_at_utc']}</p>
+      <p>Total collected: {analysis['total_collected']}</p>
+      <p>Time range: {analysis['time_range']['from']} ~ {analysis['time_range']['to']}</p>
+    </section>
+
+    <section class=\"card\">
+      <h2>活跃月份分布</h2>
+      <ul>{cards}</ul>
+    </section>
+
+    <section class=\"card\">
+      <h2>高互动推文 Top 20</h2>
+      <table>
+        <thead><tr><th>#</th><th>Like</th><th>RT</th><th>Reply</th><th>Text</th><th>URL</th></tr></thead>
+        <tbody>{top_rows}</tbody>
+      </table>
+    </section>
+  </main>
+</body>
+</html>
+"""
+    path.write_text(html, encoding="utf-8")
+
+
+def main() -> None:
+    args = parse_args()
+    handle = parse_user_handle(args.user_url)
+
+    out_base = Path(args.out_dir).expanduser().resolve()
+    run_dir = out_base / f"user_{safe_name(handle)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    base_url = f"https://x.com/{handle}"
+    target_url = f"{base_url}/with_replies" if args.with_replies else base_url
+    print(f"Target user: @{handle}")
+    print(f"Timeline URL: {target_url}")
+
+    with sync_playwright() as p:
+        context = create_context(p, args.state, args.headless)
+        page = context.new_page()
+        page.goto(target_url, wait_until="domcontentloaded")
+        page.wait_for_timeout(3000)
+
+        if not validate_auth_state(page):
+            print("Authentication issue detected. Please refresh login state with login_x.py.")
+            context.close()
+            return
+
+        items = collect_user_tweets(
+            page=page,
+            max_items=args.max_items,
+            max_scrolls=args.max_scrolls,
+            no_new_stop=args.no_new_stop,
+            scroll_pause=args.scroll_pause,
+        )
+        context.close()
+
+    if not items:
+        print("Warning: No tweets were collected.")
+        return
+
+    summary = summarize(items, f"@{handle} history")
+    detailed = build_detailed_analysis(items, handle)
+
+    json_path = run_dir / "results.json"
+    csv_path = run_dir / "results.csv"
+    summary_json = run_dir / "summary.json"
+    summary_md = run_dir / "summary.md"
+    article_html = run_dir / "article.html"
+    detailed_json = run_dir / "detailed_report.json"
+    detailed_md = run_dir / "detailed_report.md"
+    detailed_html = run_dir / "detailed_report.html"
+
+    json_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_csv(csv_path, items)
+    summary_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_summary_md(summary_md, summary)
+    write_html_article(article_html, f"@{handle} 历史推文", items)
+
+    detailed_json.write_text(json.dumps(detailed, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_detailed_md(detailed_md, detailed)
+    write_detailed_html(detailed_html, detailed)
+
+    print("=" * 60)
+    print(f"Done. Collected {len(items)} tweets from @{handle}.")
+    print(f"Results JSON:      {json_path}")
+    print(f"Results CSV:       {csv_path}")
+    print(f"Summary JSON:      {summary_json}")
+    print(f"Summary Markdown:  {summary_md}")
+    print(f"Article HTML:      {article_html}")
+    print(f"Detailed JSON:     {detailed_json}")
+    print(f"Detailed Markdown: {detailed_md}")
+    print(f"Detailed HTML:     {detailed_html}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    main()
