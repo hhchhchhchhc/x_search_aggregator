@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Crawl all accounts followed by a target user on X and generate detailed reports."""
+"""Crawl accounts followed by a target user on X and generate detailed reports."""
 
 from __future__ import annotations
 
@@ -10,15 +10,39 @@ import re
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlencode
 
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import BrowserContext, sync_playwright
 
-from search_x import create_context, scroll_feed, validate_auth_state
+from search_x import create_context, validate_auth_state
 
-HANDLE_RE = re.compile(r"^/([A-Za-z0-9_]{1,15})/?$")
-ZH_RE = re.compile(r"[\u4e00-\u9fff]")
+USER_BY_SCREEN_NAME_QID = "pLsOiyHJ1eFwPJlNmLp4Bg"
+FOLLOWING_QID = "gGVkcwUnM_ISWg3NIby2TA"
+WEB_BEARER = "AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs=1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA"
+
+BASIC_FEATURES = {
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+}
+
+USER_BY_NAME_FEATURES = {
+    "hidden_profile_subscriptions_enabled": True,
+    "profile_label_improvements_pcf_label_in_post_enabled": True,
+    "responsive_web_profile_redirect_enabled": False,
+    "rweb_tipjar_consumption_enabled": False,
+    "verified_phone_label_enabled": False,
+    "subscriptions_verification_info_is_identity_verified_enabled": True,
+    "subscriptions_verification_info_verified_since_enabled": True,
+    "highlights_tweets_tab_ui_enabled": True,
+    "responsive_web_twitter_article_notes_tab_enabled": True,
+    "subscriptions_feature_can_gift_premium": True,
+    "creator_subscriptions_tweet_preview_api_enabled": True,
+    "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
+    "responsive_web_graphql_timeline_navigation_enabled": True,
+}
+
 WORD_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{2,}|[\u4e00-\u9fff]{2,}")
+ZH_RE = re.compile(r"[\u4e00-\u9fff]")
 STOPWORDS = {
     "the", "and", "for", "with", "from", "that", "this", "you", "your", "our", "are", "was",
     "一个", "这个", "那个", "我们", "你们", "他们", "关注", "简介", "没有", "默认", "用户",
@@ -32,9 +56,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--headless", action="store_true", help="Run browser in headless mode")
     p.add_argument("--out-dir", default="output", help="Output base directory")
     p.add_argument("--max-items", type=int, default=0, help="Max accounts to collect (0 means no hard limit)")
-    p.add_argument("--max-scrolls", type=int, default=1200, help="Max scroll rounds")
-    p.add_argument("--no-new-stop", type=int, default=35, help="Stop after N rounds with no new users")
-    p.add_argument("--scroll-pause", type=int, default=1400, help="Pause between scrolls in ms")
+    p.add_argument("--max-pages", type=int, default=200, help="Max API pages")
     return p.parse_args()
 
 
@@ -56,99 +78,153 @@ def parse_handle(user_url: str) -> str:
     return u.strip("/").lstrip("@")
 
 
-def extract_user_cards(page):
-    selectors = [
-        '[data-testid="UserCell"]',
-        'div[data-testid="cellInnerDiv"]:has(a[href^="/"])',
-    ]
-    cards = []
-    for sel in selectors:
-        cards.extend(page.query_selector_all(sel))
-    return cards
+def get_ct0(context: BrowserContext) -> str:
+    for c in context.cookies():
+        if c.get("name") == "ct0":
+            return c.get("value", "")
+    return ""
 
 
-def extract_following_user(card) -> dict | None:
-    links = card.query_selector_all('a[href^="/"]')
-    handle = ""
-    profile_href = ""
-    for link in links:
-        href = (link.get_attribute("href") or "").split("?")[0]
-        m = HANDLE_RE.match(href)
-        if m:
-            handle = m.group(1)
-            profile_href = href
-            break
-    if not handle:
-        return None
+def api_get(context: BrowserContext, url: str, csrf: str, referer: str) -> dict:
+    headers = {
+        "authorization": f"Bearer {WEB_BEARER}",
+        "x-csrf-token": csrf,
+        "x-twitter-active-user": "yes",
+        "x-twitter-auth-type": "OAuth2Session",
+        "x-twitter-client-language": "zh-cn",
+        "referer": referer,
+    }
+    resp = context.request.get(url, headers=headers, timeout=30000)
+    if not resp.ok:
+        raise RuntimeError(f"API request failed: {resp.status} {resp.text()[:200]}")
+    return resp.json()
 
-    user_name = ""
-    name_block = card.query_selector('[data-testid="User-Name"]')
-    if name_block:
-        spans = name_block.query_selector_all("span")
-        for sp in spans:
-            t = (sp.inner_text() or "").strip()
-            if t and not t.startswith("@"):
-                user_name = t
-                break
 
-    bio = ""
-    bio_el = card.query_selector('[data-testid="UserDescription"]')
-    if bio_el:
-        bio = (bio_el.inner_text() or "").strip()
+def build_user_by_name_url(handle: str) -> str:
+    variables = {"screen_name": handle, "withGrokTranslatedBio": False}
+    field_toggles = {"withPayments": False, "withAuxiliaryUserLabels": True}
+    q = urlencode(
+        {
+            "variables": json.dumps(variables, separators=(",", ":"), ensure_ascii=False),
+            "features": json.dumps(USER_BY_NAME_FEATURES, separators=(",", ":")),
+            "fieldToggles": json.dumps(field_toggles, separators=(",", ":")),
+        }
+    )
+    return f"https://x.com/i/api/graphql/{USER_BY_SCREEN_NAME_QID}/UserByScreenName?{q}"
 
-    card_text = (card.inner_text() or "")
-    verified = any(x in card_text for x in ["Verified", "已认证", "已验证"]) or bool(
-        card.query_selector('svg[aria-label*="Verified"], svg[aria-label*="已认证"], svg[aria-label*="已验证"]')
+
+def build_following_url(user_id: str, cursor: str | None = None) -> str:
+    variables = {"userId": user_id, "count": 100, "includePromotedContent": False}
+    if cursor:
+        variables["cursor"] = cursor
+    q = urlencode(
+        {
+            "variables": json.dumps(variables, separators=(",", ":")),
+            "features": json.dumps(BASIC_FEATURES, separators=(",", ":")),
+        }
+    )
+    return f"https://x.com/i/api/graphql/{FOLLOWING_QID}/Following?{q}"
+
+
+def parse_user_by_name(data: dict) -> tuple[str, int]:
+    u = data.get("data", {}).get("user", {}).get("result", {})
+    rest_id = u.get("rest_id") or ""
+    legacy = u.get("legacy", {}) or {}
+    friends_count = int(legacy.get("friends_count") or 0)
+    return rest_id, friends_count
+
+
+def parse_following_page(data: dict) -> tuple[list[dict], str | None]:
+    instructions = (
+        data.get("data", {})
+        .get("user", {})
+        .get("result", {})
+        .get("timeline", {})
+        .get("timeline", {})
+        .get("instructions", [])
     )
 
-    return {
-        "handle": handle,
-        "name": user_name,
-        "bio": bio,
-        "verified": bool(verified),
-        "profile_url": f"https://x.com{profile_href}",
-    }
+    users: list[dict] = []
+    bottom_cursor = None
+
+    for ins in instructions:
+        for e in ins.get("entries", []):
+            content = e.get("content", {})
+
+            if content.get("__typename") == "TimelineTimelineCursor" and content.get("cursorType") == "Bottom":
+                bottom_cursor = content.get("value")
+
+            ur = content.get("itemContent", {}).get("user_results", {}).get("result")
+            if not isinstance(ur, dict) or ur.get("__typename") != "User":
+                continue
+
+            core = ur.get("core", {}) or {}
+            legacy = ur.get("legacy", {}) or {}
+            handle = core.get("screen_name") or ""
+            if not handle:
+                continue
+
+            users.append(
+                {
+                    "handle": handle,
+                    "name": core.get("name") or "",
+                    "bio": legacy.get("description") or "",
+                    "verified": bool(ur.get("is_blue_verified", False)),
+                    "profile_url": f"https://x.com/{handle}",
+                }
+            )
+
+    return users, bottom_cursor
 
 
-def collect_following(page, max_items: int, max_scrolls: int, no_new_stop: int, scroll_pause: int) -> list[dict]:
-    seen = {}
-    no_new_rounds = 0
+def collect_following_api(
+    context: BrowserContext,
+    handle: str,
+    max_items: int,
+    max_pages: int,
+) -> tuple[list[dict], int]:
+    csrf = get_ct0(context)
+    if not csrf:
+        raise RuntimeError("ct0 cookie not found; login state may be invalid")
 
-    for idx in range(max_scrolls):
-        cards = extract_user_cards(page)
+    referer = f"https://x.com/{handle}/following"
+
+    user_meta = api_get(context, build_user_by_name_url(handle), csrf, referer)
+    user_id, profile_following_count = parse_user_by_name(user_meta)
+    if not user_id:
+        raise RuntimeError("Cannot resolve target user id via UserByScreenName")
+
+    seen: dict[str, dict] = {}
+    cursor = None
+
+    for page in range(1, max_pages + 1):
+        data = api_get(context, build_following_url(user_id, cursor), csrf, referer)
+        batch, next_cursor = parse_following_page(data)
+
         new_count = 0
-
-        for card in cards:
-            item = extract_following_user(card)
-            if not item:
+        for it in batch:
+            key = it["handle"].lower()
+            if key in seen:
                 continue
-            h = item["handle"].lower()
-            if h in seen:
-                continue
-            seen[h] = item
+            seen[key] = it
             new_count += 1
             if max_items > 0 and len(seen) >= max_items:
                 print(f"Reached max items: {max_items}")
-                return list(seen.values())
+                return list(seen.values()), profile_following_count
 
-        print(f"Scroll {idx + 1}/{max_scrolls}: +{new_count} new, total {len(seen)}")
+        print(f"Page {page}/{max_pages}: +{new_count} new, total {len(seen)}")
 
+        if not next_cursor:
+            break
         if new_count == 0:
-            no_new_rounds += 1
-        else:
-            no_new_rounds = 0
-
-        if no_new_rounds >= no_new_stop:
-            print(f"No new users for {no_new_rounds} rounds. Stop scrolling.")
             break
 
-        scroll_feed(page, idx)
-        page.wait_for_timeout(scroll_pause if new_count > 0 else int(scroll_pause * 1.35))
+        cursor = next_cursor
 
-    return list(seen.values())
+    return list(seen.values()), profile_following_count
 
 
-def analyze_following(items: list[dict], owner_handle: str) -> dict:
+def analyze_following(items: list[dict], owner_handle: str, profile_following_count: int) -> dict:
     total = len(items)
     bios = [i.get("bio", "") for i in items]
     names = [i.get("name", "") for i in items]
@@ -170,16 +246,14 @@ def analyze_following(items: list[dict], owner_handle: str) -> dict:
         if h:
             first_letter[h[0].lower()] += 1
 
-    domains = Counter()
-    for i in items:
-        u = i.get("profile_url", "")
-        if u:
-            domains[urlparse(u).netloc] += 1
+    coverage = round(total / profile_following_count, 4) if profile_following_count > 0 else None
 
     return {
         "target_user": owner_handle,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "total_following_collected": total,
+        "profile_following_count": profile_following_count,
+        "coverage_ratio": coverage,
         "profile_stats": {
             "verified_count": verified_count,
             "verified_ratio": round(verified_count / total, 4) if total else 0,
@@ -190,7 +264,6 @@ def analyze_following(items: list[dict], owner_handle: str) -> dict:
         },
         "top_keywords": [{"keyword": k, "count": v} for k, v in tokens.most_common(60)],
         "handle_initial_distribution": [{"initial": k, "count": v} for k, v in first_letter.most_common()],
-        "top_domains": [{"domain": k, "count": v} for k, v in domains.most_common()],
     }
 
 
@@ -208,7 +281,9 @@ def write_detailed_md(path: Path, analysis: dict) -> None:
         f"# Following Detailed Report: @{analysis['target_user']}",
         "",
         f"- Generated at (UTC): {analysis['generated_at_utc']}",
+        f"- Profile following count: {analysis['profile_following_count']}",
         f"- Total following collected: {analysis['total_following_collected']}",
+        f"- Coverage ratio: {analysis['coverage_ratio']}",
         f"- Verified ratio: {s['verified_ratio']}",
         f"- Bio filled ratio: {s['bio_filled_ratio']}",
         f"- Bio has Chinese ratio: {s['bio_has_chinese_ratio']}",
@@ -240,7 +315,9 @@ table{{width:100%;border-collapse:collapse}}th,td{{border-bottom:1px solid #ece5
 </style></head>
 <body><main class=\"wrap\">
 <section class=\"card\"><h1>@{analysis['target_user']} Following 详细分析</h1>
-<p>Total: {analysis['total_following_collected']}</p>
+<p>Profile following count: {analysis['profile_following_count']}</p>
+<p>Total collected: {analysis['total_following_collected']}</p>
+<p>Coverage ratio: {analysis['coverage_ratio']}</p>
 <p>Verified ratio: {s['verified_ratio']}</p>
 <p>Bio filled ratio: {s['bio_filled_ratio']}</p>
 <p>Bio has Chinese ratio: {s['bio_has_chinese_ratio']}</p>
@@ -268,19 +345,17 @@ def main() -> None:
         context = create_context(p, args.state, args.headless)
         page = context.new_page()
         page.goto(target_url, wait_until="domcontentloaded")
-        page.wait_for_timeout(3500)
-
+        page.wait_for_timeout(2500)
         if not validate_auth_state(page):
             print("Authentication issue detected. Please refresh login state with login_x.py.")
             context.close()
             return
 
-        items = collect_following(
-            page,
+        items, profile_count = collect_following_api(
+            context=context,
+            handle=owner,
             max_items=args.max_items,
-            max_scrolls=args.max_scrolls,
-            no_new_stop=args.no_new_stop,
-            scroll_pause=args.scroll_pause,
+            max_pages=args.max_pages,
         )
         context.close()
 
@@ -288,7 +363,7 @@ def main() -> None:
         print("Warning: No following users were collected.")
         return
 
-    analysis = analyze_following(items, owner)
+    analysis = analyze_following(items, owner, profile_count)
 
     json_path = run_dir / "results.json"
     csv_path = run_dir / "results.csv"
@@ -304,6 +379,8 @@ def main() -> None:
 
     print("=" * 60)
     print(f"Done. Collected {len(items)} following users from @{owner}.")
+    print(f"Profile shows following count: {profile_count}")
+    print(f"Coverage ratio: {analysis['coverage_ratio']}")
     print(f"Results JSON:      {json_path}")
     print(f"Results CSV:       {csv_path}")
     print(f"Detailed JSON:     {detail_json}")

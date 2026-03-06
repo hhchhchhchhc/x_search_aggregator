@@ -326,6 +326,31 @@ def wait_for_search_results(page: Page, timeout: int = 10000) -> bool:
         return False
 
 
+def handle_search_error_retry(page: Page, attempts: int = 3) -> bool:
+    """Click retry when search timeline returns transient loading errors."""
+    retry_selectors = [
+        'button:has-text("重试")',
+        'button:has-text("Retry")',
+        'div[role="button"]:has-text("重试")',
+        'div[role="button"]:has-text("Retry")',
+    ]
+    for i in range(attempts):
+        for selector in retry_selectors:
+            btn = page.query_selector(selector)
+            if not btn:
+                continue
+            try:
+                btn.click(timeout=2000)
+                page.wait_for_timeout(2200)
+                if get_cards(page):
+                    print(f"Recovered from search error after retry attempt {i + 1}.")
+                    return True
+            except Exception:
+                continue
+        page.wait_for_timeout(1200)
+    return bool(get_cards(page))
+
+
 def get_cards(page: Page):
     cards = []
     for selector in TWEET_SELECTORS:
@@ -649,6 +674,10 @@ def main() -> None:
             print("Warning: Search results may not have loaded properly, trying input fallback...")
             fallback_search_via_input(page, args.keyword, args.sort, args.lang)
             wait_for_search_results(page, timeout=15000)
+        
+        # If search timeline temporarily errors, attempt retry button recovery.
+        if not get_cards(page):
+            handle_search_error_retry(page, attempts=5)
         
         items = collect_tweets(
             page=page,

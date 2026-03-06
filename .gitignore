@@ -2,6 +2,7 @@
 __pycache__/
 *.pyc
 auth_state.json
+auth_state_cookie.json
 output/
 *.log
 .DS_Store
