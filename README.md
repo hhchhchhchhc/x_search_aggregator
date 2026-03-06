@@ -23,6 +23,7 @@
 | 📜 **用户历史推文** | `crawl_user_timeline.py` | 爬取任意用户的全部历史推文 |
 | 👥 **用户关注列表** | `crawl_user_following.py` | 通过内部 API 爬取用户完整关注列表 |
 | 📡 **关注者最新动态 500** | `crawl_following_timeline_500.py` | 一键抓取你关注的所有人的最新 **500 条**动态 |
+| 📊 **有用程度排名** | `rank_usefulness.py` | 对任意采集结果按有用程度智能评分，生成可视化排名 HTML |
 | 🔑 **登录状态管理** | `login_x.py` | 一次登录，持久化 session，后续全自动 |
 
 > **无需 X 开发者账号**，基于浏览器已登录会话自动化采集，零 API 配额限制。
@@ -84,6 +85,15 @@ python crawl_user_timeline.py --user-url "https://x.com/elonmusk" --max-items 0
 python crawl_user_following.py --user-url "https://x.com/elonmusk" --max-items 0
 ```
 
+#### 📊 对采集结果按有用程度排名
+
+```bash
+python rank_usefulness.py --input output/following_timeline_500_20260306_193541
+```
+
+> 支持对任意 `results.json` 使用：关键词搜索、关注者动态、用户历史推文均可。
+> 自动生成暗色主题可视化排名 HTML + 评分 JSON。
+
 ---
 
 ## 📊 输出示例
@@ -107,6 +117,14 @@ output/following_timeline_500_20260306_193541/
 ├── summary.json / md
 ├── summary.html          # 关注者活跃度排名、热门标签、Top 推文
 └── article.html          # 完整动态文章
+```
+
+**有用程度排名**输出（`rank_usefulness.py` 生成）：
+
+```
+output/<任意采集目录>/
+├── usefulness_ranking.html   # 🌟 暗色主题可视化排名页面
+└── usefulness_ranking.json   # 带评分的结构化排名数据
 ```
 
 **用户关注列表**额外输出：
@@ -168,6 +186,29 @@ output/following_vista8_20260306/
 | `--max-items` | 0 | 最大条数（0=不限） |
 | `--max-pages` | 200 | 最大 API 翻页数 |
 
+### rank_usefulness.py
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--input` | *必填* | `results.json` 路径或包含它的目录 |
+| `--title` | 自动 | 自定义页面标题 |
+| `--output` | 自动 | 输出 HTML 路径（默认同目录下 `usefulness_ranking.html`） |
+
+**评分算法：**
+
+| 维度 | 权重/规则 |
+|------|-----------|
+| ❤️ Like | ×3 |
+| 🔁 Retweet | ×5 |
+| 💬 Reply | ×2 |
+| 🔖 Bookmark | ×8 |
+| 👁️ 浏览量 | 归一化加分（上限 50） |
+| 📏 内容长度 | 越充实越高分（上限 30） |
+| 🏷️ 技术关键词 | AI/GPT/Claude/量化/开源等命中 ×3 |
+| 📋 结构化内容 | 含步骤/列表 +8 |
+| 🔗 资源链接 | 含 URL +5 |
+| 🚫 垃圾内容 | "关注我"/"抽奖"等 −5 |
+
 ---
 
 ## 🏗️ 技术架构
@@ -186,9 +227,14 @@ output/following_vista8_20260306/
 │             │  ├─ 用户信息提取               │
 │             │  └─ 智能去重 (tweet_id)        │
 ├─────────────┼───────────────────────────────┤
+│  分析层     │  智能评分 & 排名引擎           │
+│             │  ├─ 互动加权 + 内容质量信号    │
+│             │  ├─ 技术关键词 / 结构化检测    │
+│             │  └─ 垃圾内容过滤              │
+├─────────────┼───────────────────────────────┤
 │  输出层     │  JSON / CSV / Markdown / HTML  │
 │             │  ├─ 统计摘要 & 可视化报告      │
-│             │  └─ 热门标签/提及/高赞排名     │
+│             │  └─ 有用程度排名 & 深度文章    │
 └─────────────┴───────────────────────────────┘
 ```
 
@@ -238,6 +284,7 @@ x_search_aggregator/
 ├── search_x.py                    # 关键词搜索（自定义数量）
 ├── crawl_user_timeline.py         # 用户历史推文爬取
 ├── crawl_user_following.py        # 用户关注列表爬取
+├── rank_usefulness.py              # ⭐ 有用程度智能排名
 ├── search_x_api.py                # 官方 API 搜索（可选）
 ├── login_x.py                     # 登录状态保存
 ├── html_report.py                 # HTML 报告生成引擎
