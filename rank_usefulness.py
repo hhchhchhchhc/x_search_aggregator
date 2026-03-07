@@ -18,6 +18,7 @@ from __future__ import annotations
 import argparse
 import html as html_mod
 import json
+import math
 import re
 from collections import Counter
 from datetime import datetime
@@ -66,8 +67,20 @@ def parse_args() -> argparse.Namespace:
 
 # ── 评分算法 ──
 
-def usefulness_score(item: Dict) -> float:
-    """综合评分：互动加权 + 内容质量信号。"""
+def _days_since(posted_at: str) -> float | None:
+    if not posted_at:
+        return None
+    try:
+        return max(
+            0.0,
+            (datetime.now(datetime.now().astimezone().tzinfo) - datetime.fromisoformat(posted_at.replace("Z", "+00:00")).astimezone()).total_seconds() / 86400,
+        )
+    except Exception:
+        return None
+
+
+def usefulness_breakdown(item: Dict) -> Dict[str, float]:
+    """综合评分拆解：互动归一化 + 内容质量 + 轻量时效加分。"""
     likes = int(item.get("like_count", 0))
     rts = int(item.get("retweet_count", 0))
     reps = int(item.get("reply_count", 0))
@@ -76,14 +89,15 @@ def usefulness_score(item: Dict) -> float:
     text = (item.get("text") or "").strip()
     text_len = len(text)
 
-    # 互动分（加权）
-    engagement = likes * 3 + rts * 5 + reps * 2 + bmarks * 8
+    # 互动分做对数归一化，避免超大号完全碾压中腰部高质量内容
+    engagement_raw = likes * 3 + rts * 5 + reps * 2 + bmarks * 8
+    engagement = min(math.log1p(max(0, engagement_raw)) * 12, 65)
 
-    # 浏览量加分（归一化，上限 50）
-    view_bonus = min(views / 1000, 50) if views > 0 else 0
+    # 浏览量加分（对数归一化，上限 18）
+    view_bonus = min(math.log1p(max(0, views)) * 1.5, 18) if views > 0 else 0
 
     # 内容长度加分（上限 30）
-    length_bonus = min(text_len / 20, 30)
+    length_bonus = min(text_len / 28, 16)
 
     # 内容质量信号
     quality_bonus = 0.0
@@ -104,7 +118,26 @@ def usefulness_score(item: Dict) -> float:
     # 惩罚：垃圾营销词
     spam_penalty = sum(5 for s in SPAM_SIGNALS if s in text)
 
-    return engagement + view_bonus + length_bonus + quality_bonus - spam_penalty
+    # 轻量时效加分，鼓励最近 72 小时内容优先
+    recency_bonus = 0.0
+    days_old = _days_since(str(item.get("posted_at", "")))
+    if days_old is not None:
+        recency_bonus = max(0.0, 12 - min(days_old, 3) * 4)
+
+    total = engagement + view_bonus + length_bonus + quality_bonus + recency_bonus - spam_penalty
+    return {
+        "engagement": round(engagement, 2),
+        "views": round(view_bonus, 2),
+        "length": round(length_bonus, 2),
+        "quality": round(quality_bonus, 2),
+        "recency": round(recency_bonus, 2),
+        "penalty": round(spam_penalty, 2),
+        "total": round(total, 2),
+    }
+
+
+def usefulness_score(item: Dict) -> float:
+    return usefulness_breakdown(item)["total"]
 
 
 def score_badge(score: float) -> tuple[str, str]:
@@ -166,6 +199,16 @@ def build_ranking_html(items: List[Dict], title: str) -> str:
         reps = item.get("reply_count", 0)
         bmarks = item.get("bookmark_count", 0)
 
+        breakdown = item.get("_score_breakdown", {})
+        reason_html = " ".join(
+            f'<span class="reason-chip">{label} {breakdown.get(key, 0):.0f}</span>'
+            for key, label in [
+                ("engagement", "互动"),
+                ("quality", "内容"),
+                ("recency", "时效"),
+            ]
+        )
+
         rows_html.append(f"""
     <div class="tweet-card" style="border-left: 4px solid {badge_color};">
       <div class="tweet-header">
@@ -176,6 +219,7 @@ def build_ranking_html(items: List[Dict], title: str) -> str:
         <span class="time">{posted}</span>
       </div>
       <div class="tweet-body">{text_html}</div>
+      <div class="score-reasons">{reason_html}</div>
       <div class="tweet-metrics">
         <span>❤️ {likes}</span>
         <span>🔁 {rts}</span>
@@ -195,48 +239,52 @@ def build_ranking_html(items: List[Dict], title: str) -> str:
   * {{ margin: 0; padding: 0; box-sizing: border-box; }}
   body {{
     font-family: -apple-system, "SF Pro Display", "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
-    background: linear-gradient(135deg, #0f0c29, #302b63, #24243e);
-    color: #e0e0e0;
+    background:
+      radial-gradient(circle at top left, rgba(255, 196, 92, 0.22), transparent 28%),
+      radial-gradient(circle at top right, rgba(70, 149, 255, 0.2), transparent 26%),
+      linear-gradient(180deg, #0b1220, #131b2f 52%, #0f1726);
+    color: #e6edf7;
     min-height: 100vh;
   }}
-  .container {{ max-width: 900px; margin: 0 auto; padding: 24px 16px; }}
+  .container {{ max-width: 980px; margin: 0 auto; padding: 28px 18px 48px; }}
   .page-header {{
-    text-align: center; padding: 40px 20px 30px;
-    background: rgba(255,255,255,0.05); border-radius: 16px;
-    margin-bottom: 24px; backdrop-filter: blur(10px);
-    border: 1px solid rgba(255,255,255,0.1);
+    text-align: center; padding: 46px 22px 34px;
+    background: rgba(10,16,28,0.62); border-radius: 22px;
+    margin-bottom: 24px; backdrop-filter: blur(14px);
+    border: 1px solid rgba(255,255,255,0.08);
+    box-shadow: 0 20px 60px rgba(0,0,0,0.22);
   }}
   .page-header h1 {{
-    font-size: 28px;
-    background: linear-gradient(90deg, #f7971e, #ffd200);
+    font-size: 32px;
+    background: linear-gradient(90deg, #ffd166, #7cc6fe);
     -webkit-background-clip: text; -webkit-text-fill-color: transparent;
     margin-bottom: 8px;
   }}
-  .page-header .subtitle {{ color: #aaa; font-size: 14px; }}
+  .page-header .subtitle {{ color: #9fb0c8; font-size: 14px; }}
   .stats-bar {{
     display: flex; gap: 12px; flex-wrap: wrap;
     justify-content: center; margin-bottom: 24px;
   }}
   .stat-chip {{
-    background: rgba(255,255,255,0.08);
-    border: 1px solid rgba(255,255,255,0.12);
-    border-radius: 20px; padding: 8px 18px;
-    font-size: 14px; color: #ccc;
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.1);
+    border-radius: 999px; padding: 9px 18px;
+    font-size: 14px; color: #bfd0e8;
   }}
-  .stat-chip b {{ color: #ffd200; }}
+  .stat-chip b {{ color: #ffd166; }}
   .top-authors {{ text-align: center; margin-bottom: 24px; }}
   .top-authors .label {{ font-size: 13px; color: #888; margin-bottom: 6px; }}
   .tag {{
-    display: inline-block; background: rgba(247,151,30,0.15);
-    color: #f7971e; border-radius: 12px; padding: 3px 10px;
+    display: inline-block; background: rgba(255, 209, 102, 0.12);
+    color: #ffd166; border-radius: 999px; padding: 4px 10px;
     font-size: 12px; margin: 2px 3px;
   }}
   .tweet-card {{
-    background: rgba(255,255,255,0.06);
+    background: rgba(15, 23, 38, 0.78);
     border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 12px; padding: 16px 20px;
+    border-radius: 18px; padding: 18px 22px;
     margin-bottom: 14px;
-    transition: transform 0.15s, box-shadow 0.15s;
+    transition: transform 0.18s, box-shadow 0.18s, border-color 0.18s;
   }}
   .tweet-card:hover {{
     transform: translateY(-2px);
@@ -247,7 +295,7 @@ def build_ranking_html(items: List[Dict], title: str) -> str:
     display: flex; align-items: center; gap: 8px;
     flex-wrap: wrap; margin-bottom: 10px;
   }}
-  .rank {{ font-weight: 700; font-size: 16px; color: #ffd200; min-width: 36px; }}
+  .rank {{ font-weight: 700; font-size: 16px; color: #ffd166; min-width: 36px; }}
   .score {{
     color: #fff; font-size: 12px; font-weight: 600;
     padding: 2px 10px; border-radius: 10px;
@@ -257,17 +305,23 @@ def build_ranking_html(items: List[Dict], title: str) -> str:
     font-weight: 600; font-size: 14px;
   }}
   .author:hover {{ text-decoration: underline; }}
-  .name {{ color: #999; font-size: 13px; }}
-  .time {{ color: #666; font-size: 12px; margin-left: auto; }}
+  .name {{ color: #91a0b5; font-size: 13px; }}
+  .time {{ color: #718096; font-size: 12px; margin-left: auto; }}
   .tweet-body {{
-    font-size: 15px; line-height: 1.7; color: #ddd;
+    font-size: 15px; line-height: 1.72; color: #e8eef8;
     margin-bottom: 12px; word-break: break-word;
   }}
   .tweet-body a {{ color: #1d9bf0; text-decoration: none; }}
   .tweet-body a:hover {{ text-decoration: underline; }}
+  .score-reasons {{ display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }}
+  .reason-chip {{
+    font-size: 12px; color: #b7c6da; border-radius: 999px;
+    padding: 4px 10px; background: rgba(255,255,255,0.05);
+    border: 1px solid rgba(255,255,255,0.08);
+  }}
   .tweet-metrics {{
     display: flex; gap: 16px; align-items: center;
-    font-size: 13px; color: #888;
+    flex-wrap: wrap; font-size: 13px; color: #94a3b8;
   }}
   .link-btn {{
     margin-left: auto; color: #1d9bf0; text-decoration: none;
@@ -279,14 +333,14 @@ def build_ranking_html(items: List[Dict], title: str) -> str:
     background: rgba(29,155,240,0.15); border-color: #1d9bf0;
   }}
   .legend {{
-    background: rgba(255,255,255,0.04);
+    background: rgba(15, 23, 38, 0.62);
     border: 1px solid rgba(255,255,255,0.08);
-    border-radius: 12px; padding: 14px 20px;
+    border-radius: 18px; padding: 16px 20px;
     margin-bottom: 24px; font-size: 13px;
-    color: #999; line-height: 1.8;
+    color: #a8b4c6; line-height: 1.8;
   }}
-  .legend b {{ color: #ccc; }}
-  .footer {{ text-align: center; padding: 30px; color: #555; font-size: 12px; }}
+  .legend b {{ color: #d5dfec; }}
+  .footer {{ text-align: center; padding: 30px; color: #66758b; font-size: 12px; }}
 </style>
 </head>
 <body>
@@ -309,8 +363,7 @@ def build_ranking_html(items: List[Dict], title: str) -> str:
 
   <div class="legend">
     <b>评分规则：</b>
-    ❤️ Like ×3 + 🔁 RT ×5 + 💬 Reply ×2 + 🔖 Bookmark ×8 +
-    内容长度加分 + 技术关键词加分 + 结构化内容加分 + 资源链接加分<br/>
+    互动分采用对数归一化，避免超大号纯靠体量霸榜；同时叠加内容长度、关键词、结构化、链接与时效加分。<br/>
     <b>等级：</b>
     <span style="color:#e74c3c">🔥🔥🔥 ≥100</span> ·
     <span style="color:#e67e22">🔥🔥 ≥50</span> ·
@@ -356,7 +409,8 @@ def main() -> None:
 
     # 评分 & 排序
     for item in items:
-        item["_score"] = usefulness_score(item)
+        item["_score_breakdown"] = usefulness_breakdown(item)
+        item["_score"] = item["_score_breakdown"]["total"]
     items.sort(key=lambda x: x["_score"], reverse=True)
 
     # 页面标题
@@ -389,6 +443,7 @@ def main() -> None:
             "reply_count": item.get("reply_count", 0),
             "bookmark_count": item.get("bookmark_count", 0),
             "view_count": item.get("view_count", 0),
+            "score_breakdown": item.get("_score_breakdown", {}),
         }
         for i, item in enumerate(items)
     ]
