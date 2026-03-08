@@ -24,6 +24,7 @@
 - 所有结果落地为 `JSON / CSV / Markdown / HTML`
 - 推文类任务默认分两阶段执行：先抓摘要和链接，再逐条进入详情页补全全文
 - 可在控制台中桥接启动 `BettaFish`，作为外部多 Agent 舆情系统入口
+- `BettaFish` 的 `5000` 前端搜索按钮已接到正式 `POST /api/search`，会直接返回摘要和输出目录
 
 ## 🧾 最终产出长什么样
 
@@ -134,6 +135,23 @@ python web_app.py
 - 页面关闭或服务重启后，任务状态会从磁盘恢复
 
 前端控制台依赖 `Flask`，已经包含在 `requirements.txt` 中。
+
+#### 🐟 BettaFish 前端搜索
+
+当本地 BettaFish 已接入并启动后，可打开 `http://127.0.0.1:5000`：
+
+- 顶部搜索框会直接调用新版 `POST /api/search`
+- 搜索结果不再依赖旧版 Streamlit iframe 参数传递
+- 页面会直接展示每个引擎的执行状态、摘要预览和输出目录
+- 当前最稳定的正式查询链路是 `QueryEngine + iFlow + Tavily`
+
+典型返回结果会落在：
+
+```bash
+integrations/BettaFish/api_search_reports/query/<任务目录>/
+├── deep_search_report_*.md
+└── state_*.json
+```
 
 #### 🔎 关键词搜索最新 500 条
 
@@ -347,6 +365,18 @@ output/following_vista8_20260306/
 - 实时进度：显示目标条数、已抓取条数、滚动轮次、最近新增条数
 - 停止任务：可终止当前运行中的抓取子进程
 - 状态持久化：服务重启后从 `output/.web_tasks.json` 恢复任务历史
+- BettaFish `5000` 页面搜索：前端直接请求正式 `/api/search`，返回引擎摘要与输出目录
+
+---
+
+## 🐟 BettaFish 集成说明
+
+- `127.0.0.1:8080` 是本项目控制台，用来托管启动 / 停止 / 打开 BettaFish
+- `127.0.0.1:5000` 是 BettaFish 自己的前端页面
+- 当前已验证可跑通的正式链路是 `QueryEngine + iFlow + Tavily + PostgreSQL`
+- `5000` 前端搜索按钮现在走正式 `/api/search`，不再走旧的 iframe 搜索桥接
+- InsightEngine 在缺少 `sentence-transformers` / `scikit-learn` 时会自动降级跳过聚类采样，不再因为导入失败直接白屏
+- 若关键词优化接口被上游限流，系统会自动 fallback，不会因为 `keyword_optimizer` 单点失败而中断主流程
 
 ---
 
