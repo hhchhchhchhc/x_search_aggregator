@@ -11,7 +11,7 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 from urllib.parse import quote
 
 from playwright.sync_api import BrowserContext, Page, sync_playwright, TimeoutError
@@ -73,6 +73,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", default="output", help="Output base directory")
     parser.add_argument("--scroll-pause", type=int, default=2000, help="Pause between scrolls in ms")
     parser.add_argument("--retry-attempts", type=int, default=3, help="Retry attempts for failed operations")
+    parser.add_argument("--skip-fulltext", action="store_true", help="Skip stage-2 hydration from tweet detail pages")
+    parser.add_argument("--fulltext-delay-ms", type=int, default=1200, help="Pause after opening each tweet detail page")
+    parser.add_argument("--fulltext-checkpoint-every", type=int, default=10, help="Write hydration checkpoint every N tweets")
     return parser.parse_args()
 
 
@@ -399,7 +402,14 @@ def scroll_feed(page: Page, round_idx: int) -> None:
         page.keyboard.press("End")
 
 
-def collect_tweets(page: Page, max_items: int, max_scrolls: int, no_new_stop: int, scroll_pause: int) -> List[Dict]:
+def collect_tweets(
+    page: Page,
+    max_items: int,
+    max_scrolls: int,
+    no_new_stop: int,
+    scroll_pause: int,
+    checkpoint_cb: Optional[Callable[[List[Dict], int, int], None]] = None,
+) -> List[Dict]:
     """Enhanced tweet collection with better scrolling and detection"""
     seen: Dict[str, Dict] = {}
     seen_ids: Set[str] = set()
@@ -428,6 +438,8 @@ def collect_tweets(page: Page, max_items: int, max_scrolls: int, no_new_stop: in
                 new_count += 1
                 
                 if len(seen) >= max_items:
+                    if checkpoint_cb:
+                        checkpoint_cb(list(seen.values()), idx, new_count)
                     print(f"Reached max items: {max_items}")
                     return list(seen.values())
             except Exception as e:
@@ -435,6 +447,8 @@ def collect_tweets(page: Page, max_items: int, max_scrolls: int, no_new_stop: in
                 continue
 
         print(f"Scroll {idx + 1}/{max_scrolls}: +{new_count} new, total {len(seen)}")
+        if checkpoint_cb:
+            checkpoint_cb(list(seen.values()), idx, new_count)
 
         # Check if we should stop due to no new content
         if new_count == 0:
@@ -473,6 +487,38 @@ def collect_tweets(page: Page, max_items: int, max_scrolls: int, no_new_stop: in
         page.wait_for_timeout(pause_ms)
 
     return list(seen.values())
+
+
+def checkpoint_search_outputs(run_dir: Path, items: List[Dict], keyword: str) -> None:
+    summary = summarize(items, keyword)
+    (run_dir / "results.json").write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_csv(run_dir / "results.csv", items)
+    (run_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_summary_md(run_dir / "summary.md", summary)
+    write_html_article(run_dir / "article.html", keyword, items)
+
+
+def make_search_checkpoint_callback(
+    run_dir: Path,
+    keyword: str,
+    every_n_scrolls: int = 5,
+) -> Callable[[List[Dict], int, int], None]:
+    last_saved = {"scroll": 0}
+
+    def checkpoint(items: List[Dict], scroll_idx: int, new_count: int) -> None:
+        if not items:
+            return
+        should_save = (
+            scroll_idx == 0
+            or new_count > 0 and (scroll_idx + 1 - last_saved["scroll"]) >= every_n_scrolls
+        )
+        if not should_save:
+            return
+        checkpoint_search_outputs(run_dir, items, keyword)
+        last_saved["scroll"] = scroll_idx + 1
+        print(f"Checkpoint saved: {run_dir / 'results.json'}")
+
+    return checkpoint
 
 
 def to_dt(ts: Optional[str]) -> Optional[datetime]:
@@ -540,7 +586,10 @@ def write_csv(path: Path, items: List[Dict]) -> None:
         "user_name",
         "user_handle",
         "posted_at",
+        "card_text",
         "text",
+        "full_text",
+        "full_text_status",
         "reply_count",
         "retweet_count",
         "like_count",
@@ -651,6 +700,7 @@ def main() -> None:
     out_base = Path(args.out_dir).expanduser().resolve()
     run_dir = out_base / f"{safe_name(args.keyword)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Run directory: {run_dir}")
 
     search_url = make_search_url(args.keyword, args.sort, args.lang)
     print(f"Search URL: {search_url}")
@@ -685,12 +735,33 @@ def main() -> None:
             max_scrolls=args.max_scrolls,
             no_new_stop=args.no_new_stop,
             scroll_pause=args.scroll_pause,
+            checkpoint_cb=make_search_checkpoint_callback(run_dir, args.keyword),
         )
         context.close()
 
     if not items:
         print("Warning: No tweets were collected. Check your authentication and network connection.")
         return
+
+    stage1_json_path = run_dir / "results_stage1.json"
+    stage1_json_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Stage 1 saved:    {stage1_json_path}")
+
+    if not args.skip_fulltext:
+        from tweet_fulltext import hydrate_items_with_fulltext
+
+        print("Stage 2: hydrating full text from tweet detail pages...")
+        with sync_playwright() as p:
+            context = create_context(p, args.state, args.headless)
+            items = hydrate_items_with_fulltext(
+                context=context,
+                items=items,
+                run_dir=run_dir,
+                checkpoint_every=args.fulltext_checkpoint_every,
+                delay_ms=args.fulltext_delay_ms,
+                logger=print,
+            )
+            context.close()
 
     summary = summarize(items, args.keyword)
 
@@ -700,11 +771,7 @@ def main() -> None:
     summary_md = run_dir / "summary.md"
     article_html = run_dir / "article.html"
 
-    json_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_csv(csv_path, items)
-    summary_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_summary_md(summary_md, summary)
-    write_html_article(article_html, args.keyword, items)
+    checkpoint_search_outputs(run_dir, items, args.keyword)
 
     print("=" * 60)
     print(f"Done. Collected {len(items)} tweets.")

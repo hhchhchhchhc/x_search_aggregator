@@ -22,6 +22,7 @@
 - 在浏览器里查看任务进度、滚动轮次、已抓条数、最近新增条数
 - 任务关闭页面后仍保留，服务重启后会从磁盘恢复状态
 - 所有结果落地为 `JSON / CSV / Markdown / HTML`
+- 推文类任务默认分两阶段执行：先抓摘要和链接，再逐条进入详情页补全全文
 - 可在控制台中桥接启动 `BettaFish`，作为外部多 Agent 舆情系统入口
 
 ## 🧾 最终产出长什么样
@@ -152,6 +153,12 @@ python crawl_following_timeline_500.py
 python search_x.py --keyword "信息差" --max-items 300 --sort Latest --lang zh
 ```
 
+默认会在第一阶段完成后继续补全文。若只想先快速拿列表，可使用：
+
+```bash
+python search_x.py --keyword "信息差" --max-items 300 --sort Latest --lang zh --skip-fulltext
+```
+
 #### 📜 爬取用户历史推文
 
 ```bash
@@ -165,6 +172,14 @@ python crawl_user_timeline.py --user-url "https://x.com/elonmusk" --max-items 0
 ```bash
 python crawl_user_following.py --user-url "https://x.com/elonmusk" --max-items 0
 ```
+
+#### 🧩 对已有结果补全全文
+
+```bash
+python hydrate_results_fulltext.py --input output/<某次运行目录>
+```
+
+适合任务中途中断后恢复：脚本会读取已有 `results.json`，继续逐条打开推文详情页并回填全文。
 
 #### 📊 对采集结果按有用程度排名
 
@@ -212,6 +227,15 @@ output/<任意采集目录>/
 
 ```
 output/.web_tasks.json        # 前端任务队列、日志、进度缓存
+```
+
+**推文全文补全检查点**：
+
+```
+output/<任意推文采集目录>/
+├── results_stage1.json       # 第一阶段：列表页摘要/链接快照
+├── results.json              # 第二阶段：补全全文后的最终结果
+└── fulltext_progress.json    # 全文补全过程进度
 ```
 
 **用户关注列表**额外输出：

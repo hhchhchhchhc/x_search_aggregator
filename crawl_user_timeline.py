@@ -11,7 +11,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
 from statistics import median
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
 from urllib.parse import urlparse
 
 from playwright.sync_api import sync_playwright
@@ -51,6 +51,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--no-new-stop", type=int, default=25, help="Stop after N rounds with no new items")
     p.add_argument("--scroll-pause", type=int, default=1500, help="Pause between scrolls in ms")
     p.add_argument("--with-replies", action="store_true", help="Crawl /with_replies timeline")
+    p.add_argument("--skip-fulltext", action="store_true", help="Skip stage-2 hydration from tweet detail pages")
+    p.add_argument("--fulltext-delay-ms", type=int, default=1200, help="Pause after opening each tweet detail page")
+    p.add_argument("--fulltext-checkpoint-every", type=int, default=10, help="Write hydration checkpoint every N tweets")
     return p.parse_args()
 
 
@@ -181,6 +184,7 @@ def collect_user_tweets(
     max_scrolls: int,
     no_new_stop: int,
     scroll_pause: int,
+    checkpoint_cb: Optional[Callable[[List[Dict], int, int], None]] = None,
 ) -> List[Dict]:
     seen: Dict[str, Dict] = {}
     no_new_rounds = 0
@@ -206,10 +210,14 @@ def collect_user_tweets(
             new_count += 1
 
             if max_items > 0 and len(seen) >= max_items:
+                if checkpoint_cb:
+                    checkpoint_cb(list(seen.values()), idx, new_count)
                 print(f"Reached max items: {max_items}")
                 return list(seen.values())
 
         print(f"Scroll {idx + 1}/{max_scrolls}: +{new_count} new, total {len(seen)}")
+        if checkpoint_cb:
+            checkpoint_cb(list(seen.values()), idx, new_count)
 
         if new_count == 0:
             no_new_rounds += 1
@@ -265,6 +273,42 @@ def collect_user_tweets(
         page.wait_for_timeout(pause_ms)
 
     return list(seen.values())
+
+
+def checkpoint_user_timeline_outputs(run_dir: Path, items: List[Dict], handle: str) -> None:
+    summary = summarize(items, f"@{handle} history")
+    detailed = build_detailed_analysis(items, handle)
+    (run_dir / "results.json").write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_csv(run_dir / "results.csv", items)
+    (run_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_summary_md(run_dir / "summary.md", summary)
+    write_html_article(run_dir / "article.html", f"@{handle} 历史推文", items)
+    (run_dir / "detailed_report.json").write_text(json.dumps(detailed, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_detailed_md(run_dir / "detailed_report.md", detailed)
+    write_detailed_html(run_dir / "detailed_report.html", detailed)
+
+
+def make_user_timeline_checkpoint_callback(
+    run_dir: Path,
+    handle: str,
+    every_n_scrolls: int = 5,
+) -> Callable[[List[Dict], int, int], None]:
+    last_saved = {"scroll": 0}
+
+    def checkpoint(items: List[Dict], scroll_idx: int, new_count: int) -> None:
+        if not items:
+            return
+        should_save = (
+            scroll_idx == 0
+            or new_count > 0 and (scroll_idx + 1 - last_saved["scroll"]) >= every_n_scrolls
+        )
+        if not should_save:
+            return
+        checkpoint_user_timeline_outputs(run_dir, items, handle)
+        last_saved["scroll"] = scroll_idx + 1
+        print(f"Checkpoint saved: {run_dir / 'results.json'}")
+
+    return checkpoint
 
 
 def to_dt(ts: Optional[str]) -> Optional[datetime]:
@@ -363,7 +407,10 @@ def write_csv(path: Path, items: List[Dict]) -> None:
         "user_name",
         "user_handle",
         "posted_at",
+        "card_text",
         "text",
+        "full_text",
+        "full_text_status",
         "reply_count",
         "retweet_count",
         "like_count",
@@ -489,6 +536,7 @@ def main() -> None:
     out_base = Path(args.out_dir).expanduser().resolve()
     run_dir = out_base / f"user_{safe_name(handle)}_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"Run directory: {run_dir}")
 
     base_url = f"https://x.com/{handle}"
     target_url = f"{base_url}/with_replies" if args.with_replies else base_url
@@ -518,12 +566,33 @@ def main() -> None:
             max_scrolls=args.max_scrolls,
             no_new_stop=args.no_new_stop,
             scroll_pause=args.scroll_pause,
+            checkpoint_cb=make_user_timeline_checkpoint_callback(run_dir, handle),
         )
         context.close()
 
     if not items:
         print("Warning: No tweets were collected.")
         return
+
+    stage1_json_path = run_dir / "results_stage1.json"
+    stage1_json_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"Stage 1 saved:      {stage1_json_path}")
+
+    if not args.skip_fulltext:
+        from tweet_fulltext import hydrate_items_with_fulltext
+
+        print("Stage 2: hydrating full text from tweet detail pages...")
+        with sync_playwright() as p:
+            context = create_context(p, args.state, args.headless)
+            items = hydrate_items_with_fulltext(
+                context=context,
+                items=items,
+                run_dir=run_dir,
+                checkpoint_every=args.fulltext_checkpoint_every,
+                delay_ms=args.fulltext_delay_ms,
+                logger=print,
+            )
+            context.close()
 
     summary = summarize(items, f"@{handle} history")
     detailed = build_detailed_analysis(items, handle)
@@ -537,15 +606,7 @@ def main() -> None:
     detailed_md = run_dir / "detailed_report.md"
     detailed_html = run_dir / "detailed_report.html"
 
-    json_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_csv(csv_path, items)
-    summary_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_summary_md(summary_md, summary)
-    write_html_article(article_html, f"@{handle} 历史推文", items)
-
-    detailed_json.write_text(json.dumps(detailed, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_detailed_md(detailed_md, detailed)
-    write_detailed_html(detailed_html, detailed)
+    checkpoint_user_timeline_outputs(run_dir, items, handle)
 
     print("=" * 60)
     print(f"Done. Collected {len(items)} tweets from @{handle}.")

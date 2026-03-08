@@ -17,7 +17,7 @@ import time
 from collections import Counter
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set
+from typing import Callable, Dict, List, Optional, Set
 
 from playwright.sync_api import Page, sync_playwright, TimeoutError
 
@@ -56,6 +56,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-scrolls", type=int, default=300, help="最大滚动轮数")
     parser.add_argument("--no-new-stop", type=int, default=12, help="连续N轮无新推文后停止")
     parser.add_argument("--scroll-pause", type=int, default=2000, help="滚动间隔（毫秒）")
+    parser.add_argument("--skip-fulltext", action="store_true", help="跳过第二阶段全文补全")
+    parser.add_argument("--fulltext-delay-ms", type=int, default=1200, help="打开推文详情页后的等待毫秒数")
+    parser.add_argument("--fulltext-checkpoint-every", type=int, default=10, help="每补全N条写一次检查点")
     return parser.parse_args()
 
 
@@ -143,6 +146,7 @@ def collect_following_tweets(
     max_scrolls: int,
     no_new_stop: int,
     scroll_pause: int,
+    checkpoint_cb: Optional[Callable[[List[Dict], int, int], None]] = None,
 ) -> List[Dict]:
     """从首页时间线收集推文。"""
     seen: Dict[str, Dict] = {}
@@ -172,12 +176,16 @@ def collect_following_tweets(
                 new_count += 1
 
                 if len(seen) >= max_items:
+                    if checkpoint_cb:
+                        checkpoint_cb(list(seen.values()), idx, new_count)
                     print(f"已达到目标条数: {max_items}")
                     return list(seen.values())
             except Exception as e:
                 continue
 
         print(f"滚动 {idx + 1}/{max_scrolls}: +{new_count} 条新推文, 共 {len(seen)} 条")
+        if checkpoint_cb:
+            checkpoint_cb(list(seen.values()), idx, new_count)
 
         # 检查是否因无新内容而应停止
         if new_count == 0:
@@ -211,6 +219,38 @@ def collect_following_tweets(
         page.wait_for_timeout(pause_ms)
 
     return list(seen.values())
+
+
+def checkpoint_following_outputs(run_dir: Path, items: List[Dict]) -> None:
+    summary = summarize_following_timeline(items)
+    (run_dir / "results.json").write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_csv(run_dir / "results.csv", items)
+    (run_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_summary_md(run_dir / "summary.md", summary)
+    write_summary_html(run_dir / "summary.html", summary, items)
+    write_html_article(run_dir / "article.html", "关注者最新动态", items)
+
+
+def make_following_checkpoint_callback(
+    run_dir: Path,
+    every_n_scrolls: int = 5,
+) -> Callable[[List[Dict], int, int], None]:
+    last_saved = {"scroll": 0}
+
+    def checkpoint(items: List[Dict], scroll_idx: int, new_count: int) -> None:
+        if not items:
+            return
+        should_save = (
+            scroll_idx == 0
+            or new_count > 0 and (scroll_idx + 1 - last_saved["scroll"]) >= every_n_scrolls
+        )
+        if not should_save:
+            return
+        checkpoint_following_outputs(run_dir, items)
+        last_saved["scroll"] = scroll_idx + 1
+        print(f"Checkpoint saved: {run_dir / 'results.json'}")
+
+    return checkpoint
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +313,10 @@ def write_csv(path: Path, items: List[Dict]) -> None:
         "user_name",
         "user_handle",
         "posted_at",
+        "card_text",
         "text",
+        "full_text",
+        "full_text_status",
         "reply_count",
         "retweet_count",
         "like_count",
@@ -410,6 +453,7 @@ def main() -> None:
     out_base = Path(args.out_dir).expanduser().resolve()
     run_dir = out_base / f"following_timeline_500_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"运行目录: {run_dir}")
 
     print("=" * 60)
     print("获取个人账号关注的所有人的最新500条动态")
@@ -478,6 +522,7 @@ def main() -> None:
             max_scrolls=args.max_scrolls,
             no_new_stop=args.no_new_stop,
             scroll_pause=args.scroll_pause,
+            checkpoint_cb=make_following_checkpoint_callback(run_dir),
         )
         context.close()
 
@@ -496,6 +541,26 @@ def main() -> None:
 
     print(f"\n成功收集 {len(items)} 条推文（目标: {max_items}条）")
 
+    stage1_json_path = run_dir / "results_stage1.json"
+    stage1_json_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"阶段1结果已保存: {stage1_json_path}")
+
+    if not args.skip_fulltext:
+        from tweet_fulltext import hydrate_items_with_fulltext
+
+        print("开始第二阶段：逐条补全推文全文...")
+        with sync_playwright() as p:
+            context = create_context(p, args.state, args.headless)
+            items = hydrate_items_with_fulltext(
+                context=context,
+                items=items,
+                run_dir=run_dir,
+                checkpoint_every=args.fulltext_checkpoint_every,
+                delay_ms=args.fulltext_delay_ms,
+                logger=print,
+            )
+            context.close()
+
     # 生成摘要
     summary = summarize_following_timeline(items)
 
@@ -507,12 +572,7 @@ def main() -> None:
     summary_html = run_dir / "summary.html"
     article_html = run_dir / "article.html"
 
-    json_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_csv(csv_path, items)
-    summary_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_summary_md(summary_md, summary)
-    write_summary_html(summary_html, summary, items)
-    write_html_article(article_html, "关注者最新动态", items)
+    checkpoint_following_outputs(run_dir, items)
 
     print("=" * 60)
     print(f"完成！已收集 {len(items)} 条关注者动态。")

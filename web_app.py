@@ -39,6 +39,8 @@ PAGE_EN_RE = re.compile(r"Page\s+(\d+)(?:/(\d+))?:\s*\+\s*(\d+)\s+new,\s+total\s
 TARGET_RE = re.compile(r"目标:\s*收集前\s*(\d+)\s*条")
 SUCCESS_RE = re.compile(r"成功收集\s+(\d+)\s+条推文(?:（目标:\s*(\d+)条）)?")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+RUN_DIR_RE = re.compile(r"(?:Run directory|运行目录):\s*(.+)")
+FULLTEXT_RE = re.compile(r"\[FULLTEXT\]\s+(\d+)/(\d+)\s+(\d+)")
 
 app = Flask(__name__)
 
@@ -94,6 +96,10 @@ def task_to_disk_record(task: Dict) -> Dict:
         "current_scroll": task.get("current_scroll", 0),
         "max_scrolls": task.get("max_scrolls", 0),
         "last_new_items": task.get("last_new_items", 0),
+        "fulltext_total": task.get("fulltext_total", 0),
+        "fulltext_processed": task.get("fulltext_processed", 0),
+        "fulltext_hydrated": task.get("fulltext_hydrated", 0),
+        "fulltext_failed": task.get("fulltext_failed", 0),
     }
 
 
@@ -135,6 +141,10 @@ def load_tasks_from_disk() -> None:
                 "current_scroll": int(record.get("current_scroll", 0) or 0),
                 "max_scrolls": int(record.get("max_scrolls", 0) or 0),
                 "last_new_items": int(record.get("last_new_items", 0) or 0),
+                "fulltext_total": int(record.get("fulltext_total", 0) or 0),
+                "fulltext_processed": int(record.get("fulltext_processed", 0) or 0),
+                "fulltext_hydrated": int(record.get("fulltext_hydrated", 0) or 0),
+                "fulltext_failed": int(record.get("fulltext_failed", 0) or 0),
             }
             if task["status"] in {"queued", "running", "cancelling"}:
                 task["status"] = "interrupted"
@@ -483,6 +493,8 @@ def run_report_files(run_dir: Path) -> List[Dict]:
         ("摘要页", run_dir / "summary.html"),
         ("评分 JSON", run_dir / "usefulness_ranking.json"),
         ("结果 JSON", run_dir / "results.json"),
+        ("阶段1结果 JSON", run_dir / "results_stage1.json"),
+        ("全文补全进度", run_dir / "fulltext_progress.json"),
         ("结果 CSV", run_dir / "results.csv"),
         ("摘要 Markdown", run_dir / "summary.md"),
         ("详细报告", run_dir / "detailed_report.html"),
@@ -702,6 +714,24 @@ def trim_logs(lines: List[str]) -> List[str]:
     return ["...[日志过长，已截断较早内容]..."] + lines[-LOG_LIMIT:]
 
 
+def read_fulltext_progress(run_dir: Path | None) -> Dict[str, int]:
+    if not run_dir or not run_dir.exists():
+        return {"fulltext_total": 0, "fulltext_processed": 0, "fulltext_hydrated": 0, "fulltext_failed": 0}
+    path = run_dir / "fulltext_progress.json"
+    if not path.exists():
+        return {"fulltext_total": 0, "fulltext_processed": 0, "fulltext_hydrated": 0, "fulltext_failed": 0}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {"fulltext_total": 0, "fulltext_processed": 0, "fulltext_hydrated": 0, "fulltext_failed": 0}
+    return {
+        "fulltext_total": int(payload.get("total", 0) or 0),
+        "fulltext_processed": int(payload.get("processed", 0) or 0),
+        "fulltext_hydrated": int(payload.get("hydrated", 0) or 0),
+        "fulltext_failed": int(payload.get("failed", 0) or 0),
+    }
+
+
 def append_log(task_id: str, line: str) -> None:
     clean = line.rstrip("\n")
     with TASKS_LOCK:
@@ -717,6 +747,15 @@ def append_log(task_id: str, line: str) -> None:
 
 def infer_progress(task: Dict, line: str) -> None:
     lowered = line.lower()
+    run_dir_match = RUN_DIR_RE.search(line)
+    if run_dir_match:
+        try:
+            run_dir = Path(run_dir_match.group(1).strip()).resolve()
+            if OUTPUT_DIR in run_dir.parents:
+                task["result_dir"] = str(run_dir)
+        except Exception:
+            pass
+
     target_match = TARGET_RE.search(line)
     if target_match:
         task["target_items"] = int(target_match.group(1))
@@ -770,6 +809,16 @@ def infer_progress(task: Dict, line: str) -> None:
         if success_match.group(2):
             task["target_items"] = int(success_match.group(2))
 
+    fulltext_match = FULLTEXT_RE.search(line)
+    if fulltext_match:
+        processed = int(fulltext_match.group(1))
+        total = int(fulltext_match.group(2))
+        task["fulltext_processed"] = processed
+        task["fulltext_total"] = total
+        task["stage"] = "正在补全文"
+        if total > 0:
+            task["progress"] = max(task["progress"], min(96, 82 + int(processed / total * 14)))
+
     if "读取 " in line and "results.json" in line:
         task["stage"] = "正在评分排序"
         task["progress"] = max(task["progress"], 88)
@@ -778,6 +827,9 @@ def infer_progress(task: Dict, line: str) -> None:
         task["progress"] = max(task["progress"], 96)
     elif "成功收集" in line or "完成！已收集" in line:
         task["stage"] = "抓取完成，准备评分"
+        task["progress"] = max(task["progress"], 82)
+    elif "stage 2: hydrating full text" in lowered or "开始第二阶段：逐条补全推文全文" in line:
+        task["stage"] = "正在补全文"
         task["progress"] = max(task["progress"], 82)
     elif "search url" in lowered or "搜索关键词" in line:
         task["stage"] = "正在打开搜索页"
@@ -803,6 +855,8 @@ def list_tasks_payload(limit: int = 24) -> List[Dict]:
     tasks.sort(key=lambda t: t["created_at"], reverse=True)
     payload = []
     for task in tasks[:limit]:
+        run_dir = Path(task["result_dir"]) if task.get("result_dir") else None
+        fulltext = read_fulltext_progress(run_dir)
         payload.append(
             {
                 "id": task["id"],
@@ -814,13 +868,17 @@ def list_tasks_payload(limit: int = 24) -> List[Dict]:
                 "updated_at": task["updated_at"],
                 "message": task["message"],
                 "error": task["error"],
-                "result_dir": Path(task["result_dir"]).name if task.get("result_dir") else "",
+                "result_dir": run_dir.name if run_dir else "",
                 "cancel_requested": task.get("cancel_requested", False),
                 "target_items": task.get("target_items", 0),
                 "collected_items": task.get("collected_items", 0),
                 "current_scroll": task.get("current_scroll", 0),
                 "max_scrolls": task.get("max_scrolls", 0),
                 "last_new_items": task.get("last_new_items", 0),
+                "fulltext_total": fulltext["fulltext_total"] or task.get("fulltext_total", 0),
+                "fulltext_processed": fulltext["fulltext_processed"] or task.get("fulltext_processed", 0),
+                "fulltext_hydrated": fulltext["fulltext_hydrated"] or task.get("fulltext_hydrated", 0),
+                "fulltext_failed": fulltext["fulltext_failed"] or task.get("fulltext_failed", 0),
             }
         )
     return payload
@@ -847,6 +905,37 @@ def run_command_stream(task_id: str, args: List[str], stage: str, progress_floor
     code = process.wait()
     update_task(task_id, process=None, pid=None)
     return code
+
+
+def finalize_partial_outputs(task_id: str, task_type: str) -> bool:
+    with TASKS_LOCK:
+        task = TASKS.get(task_id)
+        run_dir = Path(task["result_dir"]) if task and task.get("result_dir") else None
+    if not run_dir or not run_dir.exists():
+        return False
+    if task_type not in {"keyword", "following", "user_timeline"}:
+        return False
+    results_json = run_dir / "results.json"
+    if not results_json.exists():
+        return False
+
+    update_task(task_id, stage="正在整理已抓取结果", progress=96, result_dir=str(run_dir))
+    append_log(task_id, f"[SYSTEM] 正在基于已抓取内容生成汇总文件：{run_dir.name}")
+    proc = subprocess.run(
+        [sys.executable, "rank_usefulness.py", "--input", str(run_dir)],
+        cwd=BASE_DIR,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+    if proc.stdout:
+        for line in proc.stdout.splitlines():
+            append_log(task_id, line)
+    if proc.returncode != 0:
+        append_log(task_id, "[SYSTEM] 已停止任务，但补充生成排序页面失败。")
+        return False
+    append_log(task_id, "[SYSTEM] 已停止任务，并生成当前结果的汇总页面。")
+    return True
 
 
 def terminate_task_process(task_id: str) -> bool:
@@ -907,6 +996,10 @@ def create_task(task_type: str, params: Dict) -> str:
         "current_scroll": 0,
         "max_scrolls": 0,
         "last_new_items": 0,
+        "fulltext_total": 0,
+        "fulltext_processed": 0,
+        "fulltext_hydrated": 0,
+        "fulltext_failed": 0,
     }
     with TASKS_LOCK:
         TASKS[task_id] = task
@@ -926,6 +1019,7 @@ def task_payload(task_id: str) -> Dict:
                 {"label": label, "url": url}
                 for label, url in resolve_report_links(run_dir)
             ]
+        fulltext = read_fulltext_progress(run_dir)
         return {
             "id": task["id"],
             "type": task["type"],
@@ -945,14 +1039,20 @@ def task_payload(task_id: str) -> Dict:
             "current_scroll": task.get("current_scroll", 0),
             "max_scrolls": task.get("max_scrolls", 0),
             "last_new_items": task.get("last_new_items", 0),
+            "fulltext_total": fulltext["fulltext_total"] or task.get("fulltext_total", 0),
+            "fulltext_processed": fulltext["fulltext_processed"] or task.get("fulltext_processed", 0),
+            "fulltext_hydrated": fulltext["fulltext_hydrated"] or task.get("fulltext_hydrated", 0),
+            "fulltext_failed": fulltext["fulltext_failed"] or task.get("fulltext_failed", 0),
         }
 
 
-def run_keyword_job(task_id: str, keyword: str, lang: str, state: str, headless: bool) -> None:
+def run_keyword_job(task_id: str, keyword: str, lang: str, state: str, headless: bool, hydrate_fulltext: bool) -> None:
     before = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()} if OUTPUT_DIR.exists() else set()
     cmd = [sys.executable, "search_keyword_500.py", "--keyword", keyword, "--state", state]
     if lang:
         cmd.extend(["--lang", lang])
+    if not hydrate_fulltext:
+        cmd.append("--skip-fulltext")
     if headless:
         cmd.append("--headless")
     code = run_command_stream(task_id, cmd, "正在抓取关键词结果", 5)
@@ -976,9 +1076,11 @@ def run_keyword_job(task_id: str, keyword: str, lang: str, state: str, headless:
     )
 
 
-def run_following_job(task_id: str, state: str, headless: bool) -> None:
+def run_following_job(task_id: str, state: str, headless: bool, hydrate_fulltext: bool) -> None:
     before = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()} if OUTPUT_DIR.exists() else set()
     cmd = [sys.executable, "crawl_following_timeline_500.py", "--state", state]
+    if not hydrate_fulltext:
+        cmd.append("--skip-fulltext")
     if headless:
         cmd.append("--headless")
     code = run_command_stream(task_id, cmd, "正在抓取关注流", 5)
@@ -1002,9 +1104,11 @@ def run_following_job(task_id: str, state: str, headless: bool) -> None:
     )
 
 
-def run_user_timeline_job(task_id: str, user_url: str, state: str, headless: bool) -> None:
+def run_user_timeline_job(task_id: str, user_url: str, state: str, headless: bool, hydrate_fulltext: bool) -> None:
     before = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()} if OUTPUT_DIR.exists() else set()
     cmd = [sys.executable, "crawl_user_timeline.py", "--user-url", user_url, "--state", state, "--max-items", "0"]
+    if not hydrate_fulltext:
+        cmd.append("--skip-fulltext")
     if headless:
         cmd.append("--headless")
     code = run_command_stream(task_id, cmd, "正在抓取博主历史推文", 5)
@@ -1057,11 +1161,15 @@ def worker(task_id: str) -> None:
             task = dict(TASKS[task_id])
         params = task["params"]
         if task["type"] == "keyword":
-            run_keyword_job(task_id, params["keyword"], params["lang"], params["state"], params["headless"])
+            run_keyword_job(
+                task_id, params["keyword"], params["lang"], params["state"], params["headless"], params.get("hydrate_fulltext", True)
+            )
         elif task["type"] == "following":
-            run_following_job(task_id, params["state"], params["headless"])
+            run_following_job(task_id, params["state"], params["headless"], params.get("hydrate_fulltext", True))
         elif task["type"] == "user_timeline":
-            run_user_timeline_job(task_id, params["user_url"], params["state"], params["headless"])
+            run_user_timeline_job(
+                task_id, params["user_url"], params["state"], params["headless"], params.get("hydrate_fulltext", True)
+            )
         elif task["type"] == "user_following":
             run_user_following_job(task_id, params["user_url"], params["state"], params["headless"])
         else:
@@ -1070,7 +1178,9 @@ def worker(task_id: str) -> None:
             task = TASKS.get(task_id)
             cancelled = bool(task and task.get("cancel_requested"))
         if cancelled:
-            update_task(task_id, status="cancelled", stage="已停止", message="任务已停止。", progress=100)
+            finalized = finalize_partial_outputs(task_id, task["type"])
+            message = "任务已停止，并已生成当前结果的汇总页面。" if finalized else "任务已停止。"
+            update_task(task_id, status="cancelled", stage="已停止", message=message, progress=100)
         else:
             update_task(task_id, status="done", stage="已完成", progress=100)
     except Exception as exc:
@@ -1078,7 +1188,10 @@ def worker(task_id: str) -> None:
             task = TASKS.get(task_id)
             cancelled = bool(task and task.get("cancel_requested"))
         if cancelled:
-            update_task(task_id, status="cancelled", stage="已停止", message="任务已停止。", progress=100)
+            task_type = task.get("type") if task else ""
+            finalized = finalize_partial_outputs(task_id, task_type)
+            message = "任务已停止，并已生成当前结果的汇总页面。" if finalized else "任务已停止。"
+            update_task(task_id, status="cancelled", stage="已停止", message=message, progress=100)
             append_log(task_id, "[SYSTEM] 任务已按请求中止。")
         else:
             update_task(task_id, status="failed", stage="执行失败", error=str(exc), progress=100)
@@ -1472,6 +1585,11 @@ def render_page() -> str:
             <input type="checkbox" name="headless" value="1" checked />
             <span>无头模式运行</span>
           </label>
+          <label class="checkbox">
+            <input type="checkbox" name="hydrate_fulltext" value="1" checked />
+            <span>逐条进入详情页补全文</span>
+          </label>
+          <div class="mini-note">关闭后会只抓列表页摘要和链接，速度更快；开启后会补全长帖正文，并生成 `fulltext_progress.json`。</div>
           <button class="btn" type="submit">开始抓取关键词</button>
         </form>
 
@@ -1485,6 +1603,11 @@ def render_page() -> str:
             <input type="checkbox" name="headless" value="1" checked />
             <span>无头模式运行</span>
           </label>
+          <label class="checkbox">
+            <input type="checkbox" name="hydrate_fulltext" value="1" checked />
+            <span>逐条进入详情页补全文</span>
+          </label>
+          <div class="mini-note">停止任务时，如果已经落盘了部分结果，系统会立即基于当前结果生成可查看的汇总页面。</div>
           <button class="btn alt" type="submit">开始抓取关注流</button>
         </form>
 
@@ -1501,6 +1624,11 @@ def render_page() -> str:
             <input type="checkbox" name="headless" value="1" checked />
             <span>无头模式运行</span>
           </label>
+          <label class="checkbox">
+            <input type="checkbox" name="hydrate_fulltext" value="1" checked />
+            <span>逐条进入详情页补全文</span>
+          </label>
+          <div class="mini-note">运行中会周期性保存部分结果；如果中途点击停止，会尽量立即生成当前已抓取内容的汇总 HTML。</div>
           <button class="btn" type="submit">开始抓取历史推文</button>
         </form>
 
@@ -1717,6 +1845,15 @@ def render_page() -> str:
       }
       if (task.last_new_items) {
         facts.push(`最近新增 ${task.last_new_items} 条`);
+      }
+      if (task.fulltext_total) {
+        facts.push(`全文 ${task.fulltext_processed || 0} / ${task.fulltext_total}`);
+      }
+      if (task.fulltext_hydrated) {
+        facts.push(`补全成功 ${task.fulltext_hydrated}`);
+      }
+      if (task.fulltext_failed) {
+        facts.push(`补全失败 ${task.fulltext_failed}`);
       }
       return facts;
     }
@@ -2209,6 +2346,7 @@ def api_task_keyword():
             "lang": (request.form.get("lang") or "").strip(),
             "state": (request.form.get("state") or DEFAULT_STATE).strip(),
             "headless": request.form.get("headless") == "1",
+            "hydrate_fulltext": request.form.get("hydrate_fulltext") == "1",
         },
     )
     return jsonify({"task_id": task_id})
@@ -2221,6 +2359,7 @@ def api_task_following():
         {
             "state": (request.form.get("state") or DEFAULT_STATE).strip(),
             "headless": request.form.get("headless") == "1",
+            "hydrate_fulltext": request.form.get("hydrate_fulltext") == "1",
         },
     )
     return jsonify({"task_id": task_id})
@@ -2237,6 +2376,7 @@ def api_task_user_timeline():
             "user_url": user_url,
             "state": (request.form.get("state") or DEFAULT_STATE).strip(),
             "headless": request.form.get("headless") == "1",
+            "hydrate_fulltext": request.form.get("hydrate_fulltext") == "1",
         },
     )
     return jsonify({"task_id": task_id})

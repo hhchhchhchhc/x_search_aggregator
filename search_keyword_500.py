@@ -21,6 +21,8 @@ from search_x import (
     write_csv,
     write_summary_md,
     safe_name,
+    make_search_checkpoint_callback,
+    checkpoint_search_outputs,
 )
 from html_report import write_html_article
 import json
@@ -45,6 +47,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-scrolls", type=int, default=200, help="最大滚动轮数")
     parser.add_argument("--no-new-stop", type=int, default=10, help="连续N轮无新推文后停止")
     parser.add_argument("--scroll-pause", type=int, default=2000, help="滚动间隔（毫秒）")
+    parser.add_argument("--skip-fulltext", action="store_true", help="跳过第二阶段全文补全")
+    parser.add_argument("--fulltext-delay-ms", type=int, default=1200, help="打开推文详情页后的等待毫秒数")
+    parser.add_argument("--fulltext-checkpoint-every", type=int, default=10, help="每补全N条写一次检查点")
     return parser.parse_args()
 
 
@@ -58,6 +63,7 @@ def main() -> None:
     out_base = Path(args.out_dir).expanduser().resolve()
     run_dir = out_base / f"{safe_name(args.keyword)}_500_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     run_dir.mkdir(parents=True, exist_ok=True)
+    print(f"运行目录: {run_dir}")
 
     search_url = make_search_url(args.keyword, sort, args.lang)
     print(f"搜索关键词: {args.keyword}")
@@ -101,6 +107,7 @@ def main() -> None:
             max_scrolls=args.max_scrolls,
             no_new_stop=args.no_new_stop,
             scroll_pause=args.scroll_pause,
+            checkpoint_cb=make_search_checkpoint_callback(run_dir, args.keyword),
         )
         context.close()
 
@@ -121,6 +128,26 @@ def main() -> None:
 
     print(f"成功收集 {len(items)} 条推文（目标: {max_items}条）")
 
+    stage1_json_path = run_dir / "results_stage1.json"
+    stage1_json_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"阶段1结果已保存: {stage1_json_path}")
+
+    if not args.skip_fulltext:
+        from tweet_fulltext import hydrate_items_with_fulltext
+
+        print("开始第二阶段：逐条补全推文全文...")
+        with sync_playwright() as p:
+            context = create_context(p, args.state, args.headless)
+            items = hydrate_items_with_fulltext(
+                context=context,
+                items=items,
+                run_dir=run_dir,
+                checkpoint_every=args.fulltext_checkpoint_every,
+                delay_ms=args.fulltext_delay_ms,
+                logger=print,
+            )
+            context.close()
+
     # 生成摘要
     summary = summarize(items, args.keyword)
 
@@ -131,11 +158,7 @@ def main() -> None:
     summary_md = run_dir / "summary.md"
     article_html = run_dir / "article.html"
 
-    json_path.write_text(json.dumps(items, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_csv(csv_path, items)
-    summary_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
-    write_summary_md(summary_md, summary)
-    write_html_article(article_html, args.keyword, items)
+    checkpoint_search_outputs(run_dir, items, args.keyword)
 
     print("=" * 60)
     print(f"完成！已收集 {len(items)} 条推文。")
