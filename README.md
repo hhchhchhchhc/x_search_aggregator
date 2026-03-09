@@ -528,7 +528,7 @@ x_search_aggregator/
 
 ## 👥 AI 超级个体效率工具分享群
 
-> 群聊：AI 超级个体效率工具分享群 3
+> 群聊：AI 超级个体效率工具分享群 4
 
 ![群聊二维码](assets/ai-super-individual-tools-group3-qr.jpg)
 
