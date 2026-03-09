@@ -34,6 +34,7 @@ INTEGRATIONS_DB_PATH = BASE_DIR / "output" / ".web_integrations.json"
 MAILER_DB_PATH = BASE_DIR / "output" / ".web_mailer.json"
 DEFAULT_STATE = "auth_state_cookie.json"
 DEFAULT_ZHIHU_USER_AGENT = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/141.0.0.0 Safari/537.36"
+DEFAULT_XHS_USER_AGENT = DEFAULT_ZHIHU_USER_AGENT
 DEFAULT_ZHIHU_COOKIE = os.environ.get("ZHIHU_DEFAULT_COOKIE", "").strip()
 DEFAULT_XHS_COOKIE = os.environ.get("XHS_DEFAULT_COOKIE", "").strip()
 LOG_LIMIT = 1200
@@ -82,7 +83,7 @@ MAILER_LOCK = threading.Lock()
 
 def sanitize_task_params(task_type: str, params: Dict) -> Dict:
     payload = dict(params or {})
-    if task_type in {"zhihu_question", "zhihu_search", "xiaohongshu_user"} and payload.get("cookie"):
+    if task_type in {"zhihu_question", "zhihu_search", "xiaohongshu_user", "xiaohongshu_search"} and payload.get("cookie"):
         payload["cookie"] = "[hidden]"
     return payload
 
@@ -1266,6 +1267,30 @@ def run_xiaohongshu_user_job(task_id: str, user_url: str, cookie: str, headless:
     )
 
 
+def run_xiaohongshu_search_job(task_id: str, keyword: str, cookie: str, user_agent: str, headless: bool) -> None:
+    before = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()} if OUTPUT_DIR.exists() else set()
+    cmd = [sys.executable, "xiaohongshu_search_keyword_500.py", "--keyword", keyword, "--cookie", cookie]
+    if user_agent:
+        cmd.extend(["--user-agent", user_agent])
+    if headless:
+        cmd.append("--headless")
+    code = run_command_stream(task_id, cmd, "正在抓取小红书搜索结果", 5)
+    if code != 0:
+        raise RuntimeError("小红书搜索抓取失败，请检查日志。")
+
+    run_dir = detect_newest_dir(before)
+    if run_dir is None:
+        raise RuntimeError("小红书搜索抓取完成，但未找到输出目录。")
+
+    update_task(
+        task_id,
+        result_dir=str(run_dir),
+        message=f"小红书搜索抓取完成：{keyword}",
+        stage="已完成",
+        progress=100,
+    )
+
+
 def worker(task_id: str) -> None:
     update_task(task_id, status="running", stage="准备启动", progress=2)
     try:
@@ -1302,6 +1327,14 @@ def worker(task_id: str) -> None:
             )
         elif task["type"] == "xiaohongshu_user":
             run_xiaohongshu_user_job(task_id, params["user_url"], params.get("cookie", ""), params["headless"])
+        elif task["type"] == "xiaohongshu_search":
+            run_xiaohongshu_search_job(
+                task_id,
+                params["keyword"],
+                params["cookie"],
+                params.get("user_agent", ""),
+                params["headless"],
+            )
         else:
             run_email_job(task_id, params)
         with TASKS_LOCK:
@@ -1339,6 +1372,7 @@ def render_page() -> str:
     safe_cookie = html.escape(DEFAULT_ZHIHU_COOKIE)
     safe_user_agent = html.escape(DEFAULT_ZHIHU_USER_AGENT)
     safe_xhs_cookie = html.escape(DEFAULT_XHS_COOKIE)
+    safe_xhs_user_agent = html.escape(DEFAULT_XHS_USER_AGENT)
     return """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -1838,6 +1872,26 @@ def render_page() -> str:
           <button class="btn" type="submit">开始抓取小红书博主</button>
         </form>
 
+        <form class="panel js-task-form" data-kind="xiaohongshu_search">
+          <h2>抓取小红书搜索前 500 条全文</h2>
+          <p>输入关键词后，系统会先保存前 500 条结果的链接和摘要到 `results_stage1.json`，再逐条打开详情页抓取正文、图片和评论，保存到 `results.json` 与 `comments.json`。</p>
+          <label>搜索关键词
+            <input type="text" name="keyword" placeholder="例如 AI Agent / 自动驾驶 / 咖啡店创业" required />
+          </label>
+          <label>Cookie 字符串
+            <textarea name="cookie" placeholder="把浏览器 Network 里小红书请求的完整 Cookie 头粘贴到这里" required>__DEFAULT_XHS_COOKIE__</textarea>
+          </label>
+          <label>User-Agent
+            <input type="text" name="user_agent" value="__DEFAULT_XHS_USER_AGENT__" />
+          </label>
+          <label class="checkbox">
+            <input type="checkbox" name="headless" value="1" checked />
+            <span>无头模式运行</span>
+          </label>
+          <div class="mini-note">输出目录会包含 `results_stage1.json`、`results.json`、`comments.json`、`results.csv`、`all_notes.md`、`failed_details.json`、`fulltext_progress.json` 和 `article.html`。</div>
+          <button class="btn alt" type="submit">开始抓取小红书搜索</button>
+        </form>
+
         <section class="panel">
           <h2>一键批量发邮件</h2>
           <p>把已生成的报告作为附件，按收件人列表逐封发送。适合把结果直接推给客户、团队或订阅用户。</p>
@@ -2275,7 +2329,8 @@ def render_page() -> str:
         user_following: "/api/tasks/user-following",
         zhihu_question: "/api/tasks/zhihu-question",
         zhihu_search: "/api/tasks/zhihu-search",
-        xiaohongshu_user: "/api/tasks/xiaohongshu-user"
+        xiaohongshu_user: "/api/tasks/xiaohongshu-user",
+        xiaohongshu_search: "/api/tasks/xiaohongshu-search"
       };
       const endpoint = endpointMap[kind];
       const button = form.querySelector("button[type='submit']");
@@ -2455,7 +2510,7 @@ def render_page() -> str:
 </body>
 </html>""".replace("__DEFAULT_ZHIHU_COOKIE__", safe_cookie).replace(
         "__DEFAULT_ZHIHU_USER_AGENT__", safe_user_agent
-    ).replace("__DEFAULT_XHS_COOKIE__", safe_xhs_cookie)
+    ).replace("__DEFAULT_XHS_COOKIE__", safe_xhs_cookie).replace("__DEFAULT_XHS_USER_AGENT__", safe_xhs_user_agent)
 
 
 @app.get("/")
@@ -2643,6 +2698,26 @@ def api_task_xiaohongshu_user():
         {
             "user_url": user_url,
             "cookie": (request.form.get("cookie") or "").strip(),
+            "headless": request.form.get("headless") == "1",
+        },
+    )
+    return jsonify({"task_id": task_id})
+
+
+@app.post("/api/tasks/xiaohongshu-search")
+def api_task_xiaohongshu_search():
+    keyword = (request.form.get("keyword") or "").strip()
+    cookie = (request.form.get("cookie") or "").strip()
+    if not keyword:
+        return jsonify({"error": "小红书搜索关键词不能为空。"}), 400
+    if not cookie:
+        return jsonify({"error": "Cookie 不能为空。"}), 400
+    task_id = start_task(
+        "xiaohongshu_search",
+        {
+            "keyword": keyword,
+            "cookie": cookie,
+            "user_agent": (request.form.get("user_agent") or "").strip(),
             "headless": request.form.get("headless") == "1",
         },
     )

@@ -75,6 +75,7 @@ python web_app.py
 - 输入任意 `x.com` 用户主页，抓取该博主关注用户列表
 - 输入任意 `zhihu.com/question/...` 问题链接，抓取该问题下所有回答完整文本
 - 输入知乎关键词，抓取搜索前 500 条结果摘要与链接，再逐条补全文
+- 输入小红书关键词，先保存前 500 条链接和摘要，再逐条补正文与评论
 - 输入小红书博主主页，抓取该博主公开可见的全部笔记卡片
 - 在同一个页面里看任务日志、进度条和历史任务
 - 直接点击生成结果打开 HTML
@@ -112,6 +113,7 @@ python web_app.py
 | 👥 **博主关注列表** | `crawl_user_following.py` | 输入任意 `x.com` 用户主页，抓取其关注用户列表并生成画像报告 |
 | 📘 **知乎问题回答全文** | `zhihu_question_answers.py` | 输入知乎问题链接 + Cookie，抓取该问题下所有回答完整文本 |
 | 📗 **知乎搜索前 500 条全文** | `zhihu_search_keyword_500.py` | 输入关键词 + Cookie，先保存前 500 条摘要和链接，再逐条补全文 |
+| 📕 **小红书搜索前 500 条全文** | `xiaohongshu_search_keyword_500.py` | 输入关键词 + Cookie，先保存前 500 条链接和摘要，再逐条补正文、图片和评论 |
 | 📕 **小红书博主全部笔记** | `xiaohongshu_user_notes.py` | 先抓博主全部公开卡片；填写 Cookie 后继续抓正文、全部图片和评论 |
 | 📊 **有用程度排名** | `rank_usefulness.py` | 对任意采集结果按有用程度智能评分，生成可视化排名 HTML |
 | 🖥️ **本地前端控制台** | `web_app.py` | 浏览器里输入关键词 / 点击按钮执行抓取，异步查看进度、日志和 HTML 结果 |
@@ -138,6 +140,7 @@ python web_app.py
 - 输入任意 `x.com` 博主主页，抓取其关注用户列表，并生成详细画像报告
 - 输入任意 `zhihu.com/question/...` 问题链接，粘贴浏览器请求头里的 Cookie，抓取全部回答全文
 - 输入知乎搜索关键词，粘贴浏览器请求头里的 Cookie，抓取前 500 条搜索结果并保存两阶段文件
+- 输入小红书搜索关键词，粘贴浏览器请求头里的 Cookie，先抓前 500 条摘要和链接，再逐条补正文和评论
 - 输入小红书博主主页链接；若填写小红书 Cookie，则继续抓正文、全部图片和评论
 - 异步查看任务进度、实时日志、最近新增条数、已抓取条数、滚动轮次
 - 在页面里查看最近生成的输出目录、切换历史任务、停止运行中的任务
@@ -219,6 +222,16 @@ python zhihu_search_keyword_500.py \
 ```
 
 > 第一阶段会保存 `results_stage1.json`，包含摘要和链接；第二阶段会逐条打开详情页并保存到 `results.json`、`results.csv`、`all_results.md`、`fulltext_progress.json` 和 `article.html`。
+
+#### 📕 爬取小红书搜索前 500 条结果并补正文 / 图片 / 评论
+
+```bash
+python xiaohongshu_search_keyword_500.py \
+  --keyword "AI Agent" \
+  --cookie "<从浏览器 Network 请求头复制的小红书 Cookie>"
+```
+
+> 第一阶段会保存 `results_stage1.json`，包含前 500 条链接和摘要；第二阶段会逐条打开详情页，抓正文、图片和评论，并保存到 `results.json`、`comments.json`、`results.csv`、`all_notes.md`、`failed_details.json`、`fulltext_progress.json` 和 `article.html`。
 
 #### 📕 爬取小红书博主全部笔记并补正文 / 图片 / 评论
 
