@@ -27,6 +27,8 @@ Social Radar turns noisy public content into something you can actually read and
 - Pull Xiaohongshu note lists, full text, images, and comments
 - Track progress in a local web console instead of staring at terminal logs
 - Persist tasks locally so history survives page refreshes and service restarts
+- Highlight the most actionable efficiency posts and the most research-inspiring AI posts
+- Explain why each highlighted item matters in Chinese inside the ranking page
 
 This repo is built for people doing:
 
@@ -116,6 +118,8 @@ Output:
 - full-text hydration
 - HTML article page
 - usefulness ranking page
+- highlighted panels for "efficiency-first" and "AI research inspiration"
+- Chinese recommendation reasons for each highlighted post
 
 ### 2. X following timeline ranking
 
@@ -128,6 +132,7 @@ Output:
 - latest following timeline items
 - ranked report by usefulness
 - HTML summaries for review
+- two extra curation blocks for high-efficiency content and AI research inspiration
 
 ### 3. Zhihu question answers
 
@@ -163,6 +168,18 @@ The local console in `web_app.py` is the main product surface.
 - open generated HTML directly
 - stop running tasks
 - persist task metadata to disk
+
+## Ranking page extras
+
+The generated `usefulness_ranking.html` is no longer just a sorted list.
+
+It now also includes:
+
+- `超级提高效率最优帮助`: posts that are most likely to improve workflows, tooling, and execution speed
+- `对 AI 研究最有启发`: posts that are most likely to trigger ideas about models, training, evaluation, or agent systems
+- Chinese recommendation reasons for every highlighted item so the page is readable without extra prompting
+
+This makes the report more useful as a review surface, not just a dump of high-score posts.
 
 For a repo like this, the console matters more than the crawler scripts. People star products, not script folders.
 
