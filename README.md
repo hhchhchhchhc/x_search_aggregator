@@ -187,6 +187,7 @@ The new Folo panel supports:
 
 - paste your own Folo cookie
 - choose `文章 / 社交 / 图片 / 视频`
+- respect the requested display count and paginate `/entries` until it collects enough rows
 - generate `summary.html` and `article.html`
 - auto-curate:
   - `超级提高效率最优帮助`
@@ -199,6 +200,8 @@ CLI entry is also available:
 ```bash
 python folo_fetch.py --cookie "<your cookie>" --view 0 --limit 20
 ```
+
+If you set `--limit 50`, the fetcher now requests more than one page when needed instead of stopping at the API's default first page size.
 
 ## Web console features
 
