@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import html
 import mimetypes
@@ -58,6 +59,22 @@ MAILER: Dict[str, object] = {
     "updated_at": "",
 }
 MAILER_LOCK = threading.Lock()
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Local web UI for running crawls and opening generated HTML reports.")
+    parser.add_argument(
+        "--host",
+        default=None,
+        help="Bind host. Defaults to HOST env var or 127.0.0.1.",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Bind port. Defaults to PORT env var or 8080.",
+    )
+    return parser.parse_args()
 
 
 def sanitize_task_params(task_type: str, params: Dict) -> Dict:
@@ -260,11 +277,13 @@ def run_report_files(run_dir: Path) -> List[Dict]:
         ("价值排序页", run_dir / "usefulness_ranking.html"),
         ("深度文章页", run_dir / "article.html"),
         ("摘要页", run_dir / "summary.html"),
+        ("区间中文 HTML", run_dir / "selected_zh.html"),
         ("知乎回答全文", run_dir / "all_answers.md"),
         ("知乎搜索全文", run_dir / "all_results.md"),
         ("小红书笔记全文", run_dir / "all_notes.md"),
         ("评分 JSON", run_dir / "usefulness_ranking.json"),
         ("结果 JSON", run_dir / "results.json"),
+        ("区间中文 JSON", run_dir / "selected_zh.json"),
         ("阶段1结果 JSON", run_dir / "results_stage1.json"),
         ("评论 JSON", run_dir / "comments.json"),
         ("网页版不可访问详情", run_dir / "unavailable_details.json"),
@@ -272,6 +291,7 @@ def run_report_files(run_dir: Path) -> List[Dict]:
         ("全文补全进度", run_dir / "fulltext_progress.json"),
         ("结果 CSV", run_dir / "results.csv"),
         ("摘要 Markdown", run_dir / "summary.md"),
+        ("区间中文 Markdown", run_dir / "selected_zh.md"),
         ("详细报告", run_dir / "detailed_report.html"),
         ("详细报告 Markdown", run_dir / "detailed_report.md"),
         ("知乎用户资料", run_dir / "profile.json"),
@@ -995,15 +1015,35 @@ def task_payload(task_id: str) -> Dict:
         }
 
 
-def run_keyword_job(task_id: str, keyword: str, lang: str, state: str, headless: bool, hydrate_fulltext: bool) -> None:
+def run_keyword_job(
+    task_id: str,
+    keyword: str,
+    search_url: str,
+    start_rank: int,
+    end_rank: int,
+    lang: str,
+    state: str,
+    headless: bool,
+    hydrate_fulltext: bool,
+    cdp_url: str = "",
+    auto_launch: bool = False,
+) -> None:
     before = {p.name for p in OUTPUT_DIR.iterdir() if p.is_dir()} if OUTPUT_DIR.exists() else set()
-    cmd = [sys.executable, "search_keyword_500.py", "--keyword", keyword, "--state", state]
+    cmd = [sys.executable, "search_keyword_500.py", "--state", state, "--start-rank", str(start_rank), "--end-rank", str(end_rank)]
+    if keyword:
+        cmd.extend(["--keyword", keyword])
+    if search_url:
+        cmd.extend(["--search-url", search_url])
     if lang:
         cmd.extend(["--lang", lang])
     if not hydrate_fulltext:
         cmd.append("--skip-fulltext")
     if headless:
         cmd.append("--headless")
+    if cdp_url:
+        cmd.extend(["--cdp-url", cdp_url])
+    if auto_launch:
+        cmd.append("--auto-launch")
     code = run_command_stream(task_id, cmd, "正在抓取关键词结果", 5)
     if code != 0:
         raise RuntimeError("关键词抓取失败，请检查日志。")
@@ -1019,7 +1059,7 @@ def run_keyword_job(task_id: str, keyword: str, lang: str, state: str, headless:
     update_task(
         task_id,
         result_dir=str(run_dir),
-        message=f"关键词 “{keyword}” 已处理完成。",
+        message=f"X 搜索已处理完成，已输出第 {start_rank} 到第 {end_rank} 条中文版内容。",
         stage="已完成",
         progress=100,
     )
@@ -1329,7 +1369,17 @@ def worker(task_id: str) -> None:
         params = task["params"]
         if task["type"] == "keyword":
             run_keyword_job(
-                task_id, params["keyword"], params["lang"], params["state"], params["headless"], params.get("hydrate_fulltext", True)
+                task_id,
+                params.get("keyword", ""),
+                params.get("search_url", ""),
+                params.get("start_rank", 1),
+                params.get("end_rank", 50),
+                params["lang"],
+                params["state"],
+                params["headless"],
+                params.get("hydrate_fulltext", True),
+                params.get("cdp_url", ""),
+                params.get("auto_launch", False),
             )
         elif task["type"] == "following":
             run_following_job(task_id, params["state"], params["headless"], params.get("hydrate_fulltext", True))
@@ -1799,10 +1849,19 @@ def render_page() -> str:
     <section class="layout">
       <div class="stack">
         <form class="panel js-task-form" data-kind="keyword">
-          <h2>关键词抓取并生成 HTML</h2>
-          <p>执行关键词抓取、深度文章生成和价值评分排序。适合做专题情报页。</p>
+          <h2>X 搜索抓取并生成中文结果</h2>
+          <p>支持直接输入关键词，或粘贴带筛选条件的 X 搜索链接。任务完成后会额外输出第 a 到第 b 条的中文版内容。</p>
           <label>关键词
-            <input type="text" name="keyword" placeholder="例如 AI Agent / 信息差 / Crypto" required />
+            <input type="text" name="keyword" placeholder="例如 AI Agent / 信息差 / Crypto；如果下方填了搜索链接，这里可留空" />
+          </label>
+          <label>X 搜索链接
+            <input type="text" name="search_url" placeholder="例如 https://x.com/search?q=post%20training%20min_retweets%3A5&src=typed_query" />
+          </label>
+          <label>起始序号 a
+            <input type="text" name="start_rank" value="1" />
+          </label>
+          <label>结束序号 b
+            <input type="text" name="end_rank" value="50" />
           </label>
           <label>语言过滤
             <input type="text" name="lang" placeholder="可留空，或填 zh / en" />
@@ -1810,16 +1869,23 @@ def render_page() -> str:
           <label>登录态文件
             <input type="text" name="state" value="auth_state_cookie.json" />
           </label>
+          <label>现有 Chrome CDP 地址
+            <input type="text" name="cdp_url" value="http://127.0.0.1:9222" />
+          </label>
           <label class="checkbox">
             <input type="checkbox" name="headless" value="1" checked />
             <span>无头模式运行</span>
           </label>
           <label class="checkbox">
+            <input type="checkbox" name="auto_launch" value="1" checked />
+            <span>若 CDP 不可用则自动拉起 Chrome</span>
+          </label>
+          <label class="checkbox">
             <input type="checkbox" name="hydrate_fulltext" value="1" checked />
             <span>逐条进入详情页补全文</span>
           </label>
-          <div class="mini-note">关闭后会只抓列表页摘要和链接，速度更快；开启后会补全长帖正文，并生成 `fulltext_progress.json`。</div>
-          <button class="btn" type="submit">开始抓取关键词</button>
+          <div class="mini-note">如果填写搜索链接，会优先使用链接中的筛选条件。输出目录会额外包含 `selected_zh.json`、`selected_zh.md` 和 `selected_zh.html`。</div>
+          <button class="btn" type="submit">开始抓取 X 搜索</button>
         </form>
 
         <form class="panel js-task-form" data-kind="x_zhihu_search">
@@ -2547,14 +2613,25 @@ def api_tasks():
 @app.post("/api/tasks/keyword")
 def api_task_keyword():
     keyword = (request.form.get("keyword") or "").strip()
-    if not keyword:
-        return jsonify({"error": "关键词不能为空。"}), 400
+    search_url = (request.form.get("search_url") or "").strip()
+    if not keyword and not search_url:
+        return jsonify({"error": "关键词和搜索链接至少填写一个。"}), 400
+    try:
+        start_rank = int((request.form.get("start_rank") or "1").strip() or "1")
+        end_rank = int((request.form.get("end_rank") or "50").strip() or "50")
+    except ValueError:
+        return jsonify({"error": "a 和 b 必须是整数。"}), 400
     task_id = start_task(
         "keyword",
         {
             "keyword": keyword,
+            "search_url": search_url,
+            "start_rank": start_rank,
+            "end_rank": end_rank,
             "lang": (request.form.get("lang") or "").strip(),
             "state": (request.form.get("state") or DEFAULT_STATE).strip(),
+            "cdp_url": (request.form.get("cdp_url") or "").strip(),
+            "auto_launch": request.form.get("auto_launch", "1") == "1",
             "headless": request.form.get("headless") == "1",
             "hydrate_fulltext": request.form.get("hydrate_fulltext") == "1",
         },
@@ -2797,9 +2874,10 @@ def serve_file(relpath: str):
 
 
 if __name__ == "__main__":
+    args = parse_args()
     OUTPUT_DIR.mkdir(exist_ok=True)
     load_tasks_from_disk()
     load_mailer_from_disk()
-    host = os.environ.get("HOST", "127.0.0.1").strip() or "127.0.0.1"
-    port = int(os.environ.get("PORT", "8080").strip() or "8080")
+    host = (args.host or os.environ.get("HOST", "127.0.0.1")).strip() or "127.0.0.1"
+    port = args.port if args.port is not None else int(os.environ.get("PORT", "8080").strip() or "8080")
     app.run(host=host, port=port, debug=False, threaded=True)

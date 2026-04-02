@@ -723,6 +723,13 @@ def create_context(
                     f"CDP endpoint did not become ready within {wait_seconds}s.\nChrome stderr:\n{stderr}"
                 )
         browser = playwright.chromium.connect_over_cdp(cdp_url)
+        state_path = Path(state)
+        if state_path.exists():
+            context_options["storage_state"] = str(state_path)
+        else:
+            print(
+                f"[Warn] storage state not found: {state_path}. Continuing without login state."
+            )
         context = browser.new_context(**context_options)
         setattr(context, "_attached_browser", browser)
         return context
